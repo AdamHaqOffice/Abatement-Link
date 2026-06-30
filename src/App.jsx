@@ -57,6 +57,7 @@ function ConfigMissing() {
         <h1>Connect Supabase to use live data.</h1>
         <p className="muted">This version is the database-backed Abatement Link build. Add your Supabase URL and anon key in Netlify environment variables, then run the included SQL schema in Supabase.</p>
         <div className="alert info">Required public vars: VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY. Required ingest vars: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, and DEVICE_INGEST_SECRET.</div>
+        <button className="secondary-button" type="button" onClick={() => window.clearAbatementLinkBrowserState?.()}>Clear browser data and reload</button>
       </section>
     </main>
   );
@@ -384,7 +385,7 @@ function IngestPage({ session, data }) {
 }
 
 function SettingsPage({ session }) {
-  return <AppShell session={session} title="Settings"><section className="panel"><p className="eyebrow">Cloud setup</p><h1>Abatement Link v2</h1><p>This build uses Supabase Auth, Supabase Postgres, Supabase Realtime, and a Netlify Function for device JSON ingest.</p><div className="alert info">SMS is intentionally not functional yet. The database/UI is ready for the future Plivo integration.</div></section><section className="panel"><h2>Required setup</h2><ol className="roadmap"><li>Run <code>database/abatement-link-supabase-schema.sql</code> in Supabase SQL Editor.</li><li>Add Netlify env vars from <code>.env.example</code>.</li><li>Enable email/password auth in Supabase.</li><li>Deploy and test with the Ingest page.</li></ol></section></AppShell>;
+  return <AppShell session={session} title="Settings"><section className="panel"><p className="eyebrow">Cloud setup</p><h1>Abatement Link v2.2</h1><p>This build uses Supabase Auth, Supabase Postgres, Supabase Realtime, and a Netlify Function for device JSON ingest.</p><div className="alert info">SMS is intentionally not functional yet. The database/UI is ready for the future Plivo integration.</div></section><section className="panel"><h2>Required setup</h2><ol className="roadmap"><li>Run <code>database/abatement-link-supabase-schema.sql</code> in Supabase SQL Editor.</li><li>Add Netlify env vars from <code>.env.example</code>.</li><li>Enable email/password auth in Supabase.</li><li>Deploy and test with the Ingest page.</li></ol></section><section className="panel"><h2>Browser reset</h2><p className="muted">Use this if a previous PWA/service-worker version or stuck Supabase session keeps sending this browser to a blank or bad page.</p><button className="secondary-button" type="button" onClick={() => window.clearAbatementLinkBrowserState?.()}>Clear browser data and reload</button></section></AppShell>;
 }
 
 export default function App() {

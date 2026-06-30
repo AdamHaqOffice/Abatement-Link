@@ -1,6 +1,6 @@
 {
-  "name": "abatement-link-v2-supabase",
-  "version": "2.0.0",
+  "name": "abatement-link-v2-2-browser-state-fix",
+  "version": "2.2.0",
   "private": true,
   "type": "module",
   "scripts": {

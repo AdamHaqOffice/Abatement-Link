@@ -1,4 +1,4 @@
-# Abatement Link v2 - Supabase Live Data Build
+# Abatement Link v2.1 - Supabase Live Data Build
 
 This is the first database-backed version of Abatement Link.
 
@@ -86,3 +86,8 @@ To validate a device from ingest, include:
 - SMS/Plivo is not wired yet. Notification logs store `future-plivo` when SMS is eventually enabled.
 - Email notification delivery is not wired yet; rules/logs are database-functional, but provider delivery should be added after the app foundation is stable.
 - Push permission request exists in the UI, but true Web Push delivery needs a VAPID/server worker integration in a later version.
+
+
+## v2.1 debug fix
+
+This version disables service-worker/offline caching while the Supabase live-data build is being tested. This prevents old cached bundles from showing a blank page after deploys. It also adds a visible startup error screen so browser runtime errors are no longer silent blank pages.
