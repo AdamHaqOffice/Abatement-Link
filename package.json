@@ -1,6 +1,6 @@
 {
-  "name": "abatement-link-v1",
-  "version": "1.0.0",
+  "name": "abatement-link-v2-supabase",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@supabase/supabase-js": "latest",
     "@vitejs/plugin-react": "latest",
     "vite": "latest",
     "react": "latest",

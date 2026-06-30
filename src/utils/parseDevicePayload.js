@@ -40,16 +40,6 @@ function getRoomSensor(eventText, fallbackRoom) {
   };
 }
 
-function getEventKind(eventText) {
-  const upper = String(eventText || '').toUpperCase();
-  if (upper.includes('HIGH')) return 'high';
-  if (upper.includes('LOW')) return 'low';
-  if (upper.includes('OK') || upper.includes('NORMAL')) return 'ok';
-  if (upper.includes('ALARM')) return 'alarm';
-  if (upper.includes('INTERVAL')) return 'interval';
-  return 'event';
-}
-
 function alarmState(value, upLimit, lowLimit, eventText) {
   const upper = String(eventText || '').toUpperCase();
   if (upper.includes('HIGH')) return 'high';
@@ -64,6 +54,7 @@ export function parsePayload(payload) {
   const serial = String(payload.unique_id || payload.serial || payload.serial_number || '').trim();
   const jobNo = String(payload.JobNo || payload.job_no || payload.jobNumber || '').trim();
   const timestamp = parseDeviceTimestamp(payload.TS || payload.timestamp);
+  const validationCode = String(payload.validation_code || payload.ValidationCode || payload.code || '').trim();
   const count = Math.max(1, Number(payload.Count || 1));
   const readings = [];
 
@@ -71,8 +62,8 @@ export function parsePayload(payload) {
     const eventText = payload[`Event${i}`] || payload.Event || '';
     if (!eventText) continue;
     const value = firstNumber(eventText);
-    const upLimit = firstNumber(payload[`UpLim${i}`] || payload.UpLim);
-    const lowLimit = firstNumber(payload[`LowLim${i}`] || payload.LowLim);
+    const upperLimit = firstNumber(payload[`UpLim${i}`] || payload.UpLim);
+    const lowerLimit = firstNumber(payload[`LowLim${i}`] || payload.LowLim);
     const { room, sensor } = getRoomSensor(eventText, payload[`RoomNo${i}`] || payload.RoomNo);
     const metric = getMetric(eventText);
     readings.push({
@@ -83,25 +74,21 @@ export function parsePayload(payload) {
       sensor,
       metric,
       value,
-      upperLimit: upLimit,
-      lowerLimit: lowLimit,
+      upperLimit,
+      lowerLimit,
       eventText: String(eventText),
-      eventKind: getEventKind(eventText),
-      alarmState: alarmState(value, upLimit, lowLimit, eventText),
+      alarmState: alarmState(value, upperLimit, lowerLimit, eventText),
       raw: payload,
     });
   }
 
-  return { serial, jobNo, timestamp: timestamp.toISOString(), readings };
+  return { serial, jobNo, timestamp: timestamp.toISOString(), validationCode, readings };
 }
 
-export function statusForDevice(device, readings) {
-  if (!device.verifiedAt) return 'not_verified';
-  const latest = readings
-    .filter((r) => r.deviceId === device.id)
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))[0];
-  if (!latest) return 'disconnected';
-  const hours = (Date.now() - new Date(latest.timestamp).getTime()) / 36e5;
+export function connectionStatus(device) {
+  if (!device?.verified_at) return 'not_verified';
+  if (!device?.last_seen_at) return 'disconnected';
+  const hours = (Date.now() - new Date(device.last_seen_at).getTime()) / 36e5;
   return hours <= 3 ? 'connected' : 'disconnected';
 }
 

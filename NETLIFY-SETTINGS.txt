@@ -1,0 +1,12 @@
+Netlify settings for Abatement Link v2
+
+Base directory: leave blank
+Build command: npm run build
+Publish directory: dist
+
+Environment variables:
+VITE_SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+VITE_SUPABASE_ANON_KEY=YOUR_SUPABASE_ANON_KEY
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=YOUR_SUPABASE_SERVICE_ROLE_KEY
+DEVICE_INGEST_SECRET=choose-a-long-random-secret

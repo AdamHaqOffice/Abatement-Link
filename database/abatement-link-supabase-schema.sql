@@ -1,0 +1,262 @@
+-- Abatement Link v2 Supabase/Postgres schema
+-- Run this in Supabase SQL Editor before deploying the app.
+-- This creates email-auth profiles, devices, live readings, alarm history, notifications, companies, and sharing.
+
+create extension if not exists pgcrypto;
+
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text unique not null,
+  name text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into public.profiles (id, email, name)
+  values (new.id, lower(new.email), coalesce(new.raw_user_meta_data->>'name', split_part(new.email, '@', 1)))
+  on conflict (id) do update set email = excluded.email, name = coalesce(excluded.name, public.profiles.name);
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert on auth.users for each row execute procedure public.handle_new_user();
+
+create table if not exists public.devices (
+  id uuid primary key default gen_random_uuid(),
+  owner_id uuid references auth.users(id) on delete set null,
+  serial_number text not null unique,
+  nickname text not null,
+  model text not null default 'PPM4',
+  validation_code text not null default lpad((floor(random() * 1000000))::text, 6, '0'),
+  verified_at timestamptz,
+  last_seen_at timestamptz,
+  last_job_no text,
+  latest_metrics jsonb not null default '{}'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.device_readings (
+  id uuid primary key default gen_random_uuid(),
+  device_id uuid not null references public.devices(id) on delete cascade,
+  serial_number text not null,
+  job_no text,
+  device_ts timestamptz not null,
+  received_at timestamptz not null default now(),
+  room_no int,
+  sensor_no int,
+  metric text not null,
+  value numeric,
+  upper_limit numeric,
+  lower_limit numeric,
+  alarm_state text not null default 'ok' check (alarm_state in ('ok', 'high', 'low', 'alarm', 'unknown')),
+  event_text text,
+  raw_payload jsonb not null default '{}'::jsonb
+);
+create index if not exists idx_device_readings_device_ts on public.device_readings(device_id, device_ts desc);
+create index if not exists idx_device_readings_serial on public.device_readings(serial_number);
+
+create table if not exists public.alarm_events (
+  id uuid primary key default gen_random_uuid(),
+  device_id uuid not null references public.devices(id) on delete cascade,
+  reading_id uuid references public.device_readings(id) on delete set null,
+  alarm_state text not null check (alarm_state in ('high', 'low', 'alarm', 'ok')),
+  metric text,
+  room_no int,
+  sensor_no int,
+  value numeric,
+  limit_value numeric,
+  event_text text,
+  started_at timestamptz not null,
+  resolved_at timestamptz,
+  created_at timestamptz not null default now()
+);
+create index if not exists idx_alarm_events_device_started on public.alarm_events(device_id, started_at desc);
+create index if not exists idx_alarm_events_open on public.alarm_events(device_id) where resolved_at is null;
+
+create table if not exists public.notification_rules (
+  id uuid primary key default gen_random_uuid(),
+  device_id uuid not null references public.devices(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  push_high boolean not null default true,
+  push_low boolean not null default true,
+  push_ok boolean not null default true,
+  email_high boolean not null default false,
+  email_low boolean not null default false,
+  email_ok boolean not null default false,
+  sms_high boolean not null default false,
+  sms_low boolean not null default false,
+  sms_ok boolean not null default false,
+  extra_emails jsonb not null default '[]'::jsonb,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(device_id, user_id)
+);
+
+create table if not exists public.notification_logs (
+  id uuid primary key default gen_random_uuid(),
+  device_id uuid not null references public.devices(id) on delete cascade,
+  alarm_id uuid references public.alarm_events(id) on delete set null,
+  user_id uuid references auth.users(id) on delete set null,
+  channel text not null check (channel in ('push', 'email', 'sms')),
+  alarm_state text not null,
+  recipients jsonb not null default '[]'::jsonb,
+  status text not null default 'queued',
+  provider_response jsonb,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.companies (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table if not exists public.company_members (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references public.companies(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  role text not null default 'viewer' check (role in ('owner', 'admin', 'viewer')),
+  invited_by uuid references auth.users(id) on delete set null,
+  accepted_at timestamptz,
+  created_at timestamptz not null default now(),
+  unique(company_id, user_id)
+);
+
+create table if not exists public.company_invites (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references public.companies(id) on delete cascade,
+  email text not null,
+  role text not null default 'viewer' check (role in ('admin', 'viewer')),
+  invited_by uuid references auth.users(id) on delete set null,
+  accepted_at timestamptz,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.company_devices (
+  id uuid primary key default gen_random_uuid(),
+  company_id uuid not null references public.companies(id) on delete cascade,
+  device_id uuid not null references public.devices(id) on delete cascade,
+  added_by uuid references auth.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  unique(company_id, device_id)
+);
+
+create or replace function public.user_can_access_device(target_device_id uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (
+    select 1 from public.devices d
+    where d.id = target_device_id and d.owner_id = auth.uid()
+  ) or exists (
+    select 1
+    from public.company_devices cd
+    join public.company_members cm on cm.company_id = cd.company_id
+    where cd.device_id = target_device_id
+      and cm.user_id = auth.uid()
+      and cm.accepted_at is not null
+  );
+$$;
+
+alter table public.profiles enable row level security;
+alter table public.devices enable row level security;
+alter table public.device_readings enable row level security;
+alter table public.alarm_events enable row level security;
+alter table public.notification_rules enable row level security;
+alter table public.notification_logs enable row level security;
+alter table public.companies enable row level security;
+alter table public.company_members enable row level security;
+alter table public.company_invites enable row level security;
+alter table public.company_devices enable row level security;
+
+-- Profiles are readable so company owners can add existing users by email.
+drop policy if exists profiles_read on public.profiles;
+create policy profiles_read on public.profiles for select to authenticated using (true);
+drop policy if exists profiles_update_own on public.profiles;
+create policy profiles_update_own on public.profiles for update to authenticated using (id = auth.uid()) with check (id = auth.uid());
+
+-- Devices
+drop policy if exists devices_select_accessible on public.devices;
+create policy devices_select_accessible on public.devices for select to authenticated using (public.user_can_access_device(id));
+drop policy if exists devices_insert_own on public.devices;
+create policy devices_insert_own on public.devices for insert to authenticated with check (owner_id = auth.uid());
+drop policy if exists devices_update_owner on public.devices;
+create policy devices_update_owner on public.devices for update to authenticated using (owner_id = auth.uid()) with check (owner_id = auth.uid());
+drop policy if exists devices_delete_owner on public.devices;
+create policy devices_delete_owner on public.devices for delete to authenticated using (owner_id = auth.uid());
+
+-- Data and alarms
+drop policy if exists readings_select_accessible on public.device_readings;
+create policy readings_select_accessible on public.device_readings for select to authenticated using (public.user_can_access_device(device_id));
+drop policy if exists alarms_select_accessible on public.alarm_events;
+create policy alarms_select_accessible on public.alarm_events for select to authenticated using (public.user_can_access_device(device_id));
+
+-- Notification rules/logs
+drop policy if exists notification_rules_select on public.notification_rules;
+create policy notification_rules_select on public.notification_rules for select to authenticated using (user_id = auth.uid() and public.user_can_access_device(device_id));
+drop policy if exists notification_rules_insert on public.notification_rules;
+create policy notification_rules_insert on public.notification_rules for insert to authenticated with check (user_id = auth.uid() and public.user_can_access_device(device_id));
+drop policy if exists notification_rules_update on public.notification_rules;
+create policy notification_rules_update on public.notification_rules for update to authenticated using (user_id = auth.uid()) with check (user_id = auth.uid() and public.user_can_access_device(device_id));
+drop policy if exists notification_rules_delete on public.notification_rules;
+create policy notification_rules_delete on public.notification_rules for delete to authenticated using (user_id = auth.uid());
+drop policy if exists notification_logs_select on public.notification_logs;
+create policy notification_logs_select on public.notification_logs for select to authenticated using (user_id = auth.uid() or public.user_can_access_device(device_id));
+
+-- Companies and sharing
+drop policy if exists companies_select_member on public.companies;
+create policy companies_select_member on public.companies for select to authenticated using (
+  created_by = auth.uid() or exists (select 1 from public.company_members cm where cm.company_id = id and cm.user_id = auth.uid() and cm.accepted_at is not null)
+);
+drop policy if exists companies_insert on public.companies;
+create policy companies_insert on public.companies for insert to authenticated with check (created_by = auth.uid());
+drop policy if exists companies_update_owner on public.companies;
+create policy companies_update_owner on public.companies for update to authenticated using (created_by = auth.uid()) with check (created_by = auth.uid());
+
+drop policy if exists company_members_select on public.company_members;
+create policy company_members_select on public.company_members for select to authenticated using (
+  user_id = auth.uid() or exists (select 1 from public.companies c where c.id = company_id and c.created_by = auth.uid()) or exists (select 1 from public.company_members cm where cm.company_id = company_id and cm.user_id = auth.uid() and cm.accepted_at is not null)
+);
+drop policy if exists company_members_insert_owner on public.company_members;
+create policy company_members_insert_owner on public.company_members for insert to authenticated with check (
+  exists (select 1 from public.companies c where c.id = company_id and c.created_by = auth.uid())
+);
+
+drop policy if exists company_invites_select_owner on public.company_invites;
+create policy company_invites_select_owner on public.company_invites for select to authenticated using (
+  email = (select lower(email) from auth.users where id = auth.uid()) or exists (select 1 from public.companies c where c.id = company_id and c.created_by = auth.uid())
+);
+drop policy if exists company_invites_insert_owner on public.company_invites;
+create policy company_invites_insert_owner on public.company_invites for insert to authenticated with check (
+  exists (select 1 from public.companies c where c.id = company_id and c.created_by = auth.uid())
+);
+
+drop policy if exists company_devices_select on public.company_devices;
+create policy company_devices_select on public.company_devices for select to authenticated using (
+  exists (select 1 from public.company_members cm where cm.company_id = company_id and cm.user_id = auth.uid() and cm.accepted_at is not null)
+  or exists (select 1 from public.companies c where c.id = company_id and c.created_by = auth.uid())
+);
+drop policy if exists company_devices_insert_owner on public.company_devices;
+create policy company_devices_insert_owner on public.company_devices for insert to authenticated with check (
+  exists (select 1 from public.companies c where c.id = company_id and c.created_by = auth.uid())
+  and exists (select 1 from public.devices d where d.id = device_id and d.owner_id = auth.uid())
+);
+drop policy if exists company_devices_delete_owner on public.company_devices;
+create policy company_devices_delete_owner on public.company_devices for delete to authenticated using (
+  exists (select 1 from public.companies c where c.id = company_id and c.created_by = auth.uid())
+);
+
+-- Realtime publication. Ignore duplicate-table warnings if you re-run sections manually.
+do $$
+begin
+  begin alter publication supabase_realtime add table public.devices; exception when duplicate_object then null; end;
+  begin alter publication supabase_realtime add table public.device_readings; exception when duplicate_object then null; end;
+  begin alter publication supabase_realtime add table public.alarm_events; exception when duplicate_object then null; end;
+  begin alter publication supabase_realtime add table public.company_devices; exception when duplicate_object then null; end;
+  begin alter publication supabase_realtime add table public.notification_logs; exception when duplicate_object then null; end;
+end $$;
