@@ -91,3 +91,12 @@ To validate a device from ingest, include:
 ## v2.1 debug fix
 
 This version disables service-worker/offline caching while the Supabase live-data build is being tested. This prevents old cached bundles from showing a blank page after deploys. It also adds a visible startup error screen so browser runtime errors are no longer silent blank pages.
+
+
+## v2.4 notes
+
+- Fixed parser bug where `R1S1` numbers could be mistaken for the reading value.
+- Datalog now separates event type from alarm state.
+- INTERVAL data inside limits is stored as OK, not High.
+- Ingest page includes Start Live Data simulator that posts believable readings every minute while the page is open.
+- Ingest endpoint accepts secret by `x-ingest-secret` header, `secret` query string, or `secret` field in JSON body.

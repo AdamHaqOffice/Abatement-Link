@@ -25,6 +25,11 @@ export function firstNumber(value) {
   return match ? Number(match[0]) : null;
 }
 
+export function lastNumber(value) {
+  const matches = String(value ?? '').match(/-?\d+(?:\.\d+)?/g);
+  return matches?.length ? Number(matches[matches.length - 1]) : null;
+}
+
 function getMetric(eventText) {
   const upper = String(eventText || '').toUpperCase();
   const match = metricAliases.find(([needle]) => upper.includes(needle));
@@ -42,6 +47,11 @@ function getRoomSensor(eventText, fallbackRoom) {
 
 function alarmState(value, upLimit, lowLimit, eventText) {
   const upper = String(eventText || '').toUpperCase();
+  if (upper.includes('INTERVAL')) {
+    if (value !== null && upLimit !== null && value > upLimit) return 'high';
+    if (value !== null && lowLimit !== null && value < lowLimit) return 'low';
+    return 'ok';
+  }
   if (upper.includes('HIGH')) return 'high';
   if (upper.includes('LOW')) return 'low';
   if (upper.includes('OK') || upper.includes('NORMAL')) return 'ok';
@@ -61,7 +71,7 @@ export function parsePayload(payload) {
   for (let i = 1; i <= count; i += 1) {
     const eventText = payload[`Event${i}`] || payload.Event || '';
     if (!eventText) continue;
-    const value = firstNumber(eventText);
+    const value = lastNumber(eventText);
     const upperLimit = firstNumber(payload[`UpLim${i}`] || payload.UpLim);
     const lowerLimit = firstNumber(payload[`LowLim${i}`] || payload.LowLim);
     const { room, sensor } = getRoomSensor(eventText, payload[`RoomNo${i}`] || payload.RoomNo);

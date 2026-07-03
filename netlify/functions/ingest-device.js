@@ -10,6 +10,11 @@ function firstNumber(value) {
   return match ? Number(match[0]) : null;
 }
 
+function lastNumber(value) {
+  const matches = String(value ?? '').match(/-?\d+(?:\.\d+)?/g);
+  return matches?.length ? Number(matches[matches.length - 1]) : null;
+}
+
 function parseDeviceTimestamp(ts) {
   if (!ts) return new Date();
   const match = String(ts).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4}),(\d{1,2}):(\d{2}):(\d{2})/);
@@ -35,6 +40,11 @@ function roomSensor(eventText, fallbackRoom) {
 
 function alarmState(value, upperLimit, lowerLimit, eventText) {
   const upper = String(eventText || '').toUpperCase();
+  if (upper.includes('INTERVAL')) {
+    if (value !== null && upperLimit !== null && value > upperLimit) return 'high';
+    if (value !== null && lowerLimit !== null && value < lowerLimit) return 'low';
+    return 'ok';
+  }
   if (upper.includes('HIGH')) return 'high';
   if (upper.includes('LOW')) return 'low';
   if (upper.includes('OK') || upper.includes('NORMAL')) return 'ok';
@@ -54,7 +64,7 @@ function parsePayload(payload) {
   for (let i = 1; i <= count; i += 1) {
     const eventText = payload[`Event${i}`] || payload.Event || '';
     if (!eventText) continue;
-    const value = firstNumber(eventText);
+    const value = lastNumber(eventText);
     const upperLimit = firstNumber(payload[`UpLim${i}`] || payload.UpLim);
     const lowerLimit = firstNumber(payload[`LowLim${i}`] || payload.LowLim);
     const metric = metricFromEvent(eventText);
@@ -88,17 +98,18 @@ export const handler = async (event) => {
   if (event.httpMethod === 'OPTIONS') return json(204, {});
   if (event.httpMethod !== 'POST') return json(405, { error: 'Use POST.' });
 
+  let payload;
+  try { payload = JSON.parse(event.body || '{}'); } catch { return json(400, { error: 'Invalid JSON.' }); }
+
   const configuredSecret = process.env.DEVICE_INGEST_SECRET;
-  if (configuredSecret && event.headers['x-ingest-secret'] !== configuredSecret) {
+  const providedSecret = event.headers['x-ingest-secret'] || event.queryStringParameters?.secret || payload.secret;
+  if (configuredSecret && providedSecret !== configuredSecret) {
     return json(401, { error: 'Invalid ingest secret.' });
   }
 
   const supabaseUrl = process.env.SUPABASE_URL;
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   if (!supabaseUrl || !serviceKey) return json(500, { error: 'Supabase server env vars are missing.' });
-
-  let payload;
-  try { payload = JSON.parse(event.body || '{}'); } catch { return json(400, { error: 'Invalid JSON.' }); }
 
   const parsed = parsePayload(payload);
   if (!parsed.serial) return json(400, { error: 'Payload must include unique_id, serial, or serial_number.' });

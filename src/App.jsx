@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate, NavLink, Route, Routes, useNavigate, useParams } from 'react-router-dom';
 import { supabase, isSupabaseConfigured } from './lib/supabaseClient.js';
 import { connectionStatus, metricIcon, metricLabel } from './utils/parseDevicePayload.js';
@@ -14,6 +14,29 @@ const samplePayload = {
   UpLim1: '-6.494 SET MENU PASSWORD',
   LowLim1: '-23.988 SET MENU PASSWORD',
 };
+
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+function deviceTimestamp(date = new Date()) {
+  const yy = String(date.getFullYear()).slice(-2);
+  return `${pad2(date.getMonth() + 1)}/${pad2(date.getDate())}/${yy},${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
+}
+
+function randomBetween(min, max, decimals = 3) {
+  const value = min + Math.random() * (max - min);
+  return Number(value.toFixed(decimals));
+}
+
+function eventTypeFromText(eventText) {
+  const upper = String(eventText || '').toUpperCase();
+  if (upper.includes('INTERVAL')) return 'Interval';
+  if (upper.includes('HIGH')) return 'High alarm';
+  if (upper.includes('LOW')) return 'Low alarm';
+  if (upper.includes('OK') || upper.includes('NORMAL')) return 'Return to OK';
+  return 'Event';
+}
 
 function StatusPill({ status }) {
   return <span className={`status-pill ${status || 'unknown'}`}>{String(status || 'unknown').replace('_', ' ')}</span>;
@@ -295,7 +318,7 @@ function DevicePage({ session, data }) {
         {metrics.map((metric) => <div className="metric-tile" key={metric}><span>{metricIcon(metric)}</span><strong>{latest[metric]?.value ?? '—'}</strong><small>{metricLabel(metric)}</small>{latest[metric]?.timestamp && <em>{new Date(latest[metric].timestamp).toLocaleString()}</em>}</div>)}
       </section>
       <section className="two-col">
-        <div className="panel"><div className="section-head"><h2>Datalog</h2><span>{readings.length}</span></div><div className="table-scroll"><table><thead><tr><th>Time</th><th>Metric</th><th>Value</th><th>Limits</th><th>Event</th></tr></thead><tbody>{readings.slice(0, 100).map((r) => <tr key={r.id}><td>{new Date(r.device_ts).toLocaleString()}</td><td>{metricLabel(r.metric)} R{r.room_no}S{r.sensor_no}</td><td>{r.value ?? '—'}</td><td>{r.lower_limit ?? '—'} / {r.upper_limit ?? '—'}</td><td><StatusPill status={r.alarm_state} /> {r.event_text}</td></tr>)}</tbody></table></div></div>
+        <div className="panel"><div className="section-head"><h2>Datalog</h2><span>{readings.length}</span></div><div className="table-scroll"><table><thead><tr><th>Time</th><th>Metric</th><th>Value</th><th>Limits</th><th>Event</th></tr></thead><tbody>{readings.slice(0, 100).map((r) => <tr key={r.id}><td>{new Date(r.device_ts).toLocaleString()}</td><td>{metricLabel(r.metric)} R{r.room_no}S{r.sensor_no}</td><td>{r.value ?? '—'}</td><td>{r.lower_limit ?? '—'} / {r.upper_limit ?? '—'}</td><td><span className="event-type-chip">{eventTypeFromText(r.event_text)}</span> <StatusPill status={r.alarm_state} /><small className="event-raw muted">{r.event_text}</small></td></tr>)}</tbody></table></div></div>
         <div className="panel"><div className="section-head"><h2>Alarm history</h2><span>{alarms.length}</span></div><div className="alarm-list">{alarms.length ? alarms.map((a) => <div className="alarm-item" key={a.id}><StatusPill status={a.alarm_state} /><strong>{metricLabel(a.metric)} {a.value}</strong><small>{new Date(a.started_at).toLocaleString()} {a.resolved_at ? `→ resolved ${new Date(a.resolved_at).toLocaleString()}` : 'active'}</small></div>) : <p className="muted">No alarms yet.</p>}</div></div>
       </section>
       <section className="panel danger-panel soft"><h2>Delete device</h2><p>Deleting removes device registration, datalog, alarm history, notification settings, and company links.</p><button className="danger-button" onClick={deleteDevice}>Delete device and data</button></section>
@@ -328,36 +351,191 @@ function NotificationsPage({ session, data }) {
 
 function CompaniesPage({ session, data }) {
   const [companyName, setCompanyName] = useState('');
-  const [invite, setInvite] = useState({ companyId: '', email: '' });
+  const [invite, setInvite] = useState({ companyId: '', email: '', role: 'viewer' });
   const [deviceLink, setDeviceLink] = useState({ companyId: '', deviceId: '' });
   const [message, setMessage] = useState('');
 
-  async function createCompany(e) {
-    e.preventDefault();
-    const { data: company, error } = await supabase.from('companies').insert({ name: companyName, created_by: session.user.id }).select().single();
-    if (error) return setMessage(error.message);
-    await supabase.from('company_members').insert({ company_id: company.id, user_id: session.user.id, role: 'owner', accepted_at: new Date().toISOString() });
-    setCompanyName(''); setMessage('Company created.'); data.refresh();
-  }
-  async function inviteUser(e) {
-    e.preventDefault();
-    const { data: profile } = await supabase.from('profiles').select('id,email').eq('email', invite.email.trim().toLowerCase()).maybeSingle();
-    if (profile) {
-      const { error } = await supabase.from('company_members').insert({ company_id: invite.companyId, user_id: profile.id, role: 'viewer', invited_by: session.user.id, accepted_at: new Date().toISOString() });
-      setMessage(error ? error.message : 'Existing user added to company.');
-    } else {
-      const { error } = await supabase.from('company_invites').insert({ company_id: invite.companyId, email: invite.email.trim().toLowerCase(), role: 'viewer', invited_by: session.user.id });
-      setMessage(error ? error.message : 'Invite saved. When that user signs up, they can be added/accepted later.');
-    }
-    data.refresh();
-  }
-  async function attachDevice(e) {
-    e.preventDefault();
-    const { error } = await supabase.from('company_devices').insert({ company_id: deviceLink.companyId, device_id: deviceLink.deviceId, added_by: session.user.id });
-    setMessage(error ? error.message : 'Device added to company.'); data.refresh();
+  function roleFor(companyId) {
+    const member = data.members.find((m) => m.company_id === companyId && m.user_id === session.user.id && m.accepted_at);
+    return member?.role || null;
   }
 
-  return <AppShell session={session} title="Companies"><section className="panel"><p className="eyebrow">Organizations</p><h1>Companies and shared devices.</h1><form className="form-grid" onSubmit={createCompany}><label>Company name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} placeholder="Customer company" /></label><button className="primary-button">Create company</button></form>{message && <div className="alert info">{message}</div>}</section><section className="two-col"><div className="panel"><h2>Add user to company</h2><form className="form-stack" onSubmit={inviteUser}><label>Company<select value={invite.companyId} onChange={(e) => setInvite({ ...invite, companyId: e.target.value })}><option value="">Choose company</option>{data.companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label><label>Email<input value={invite.email} onChange={(e) => setInvite({ ...invite, email: e.target.value })} placeholder="user@example.com" /></label><button className="secondary-button">Invite/add user</button></form></div><div className="panel"><h2>Add device to company</h2><form className="form-stack" onSubmit={attachDevice}><label>Company<select value={deviceLink.companyId} onChange={(e) => setDeviceLink({ ...deviceLink, companyId: e.target.value })}><option value="">Choose company</option>{data.companies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label><label>Device<select value={deviceLink.deviceId} onChange={(e) => setDeviceLink({ ...deviceLink, deviceId: e.target.value })}><option value="">Choose device</option>{data.devices.map((d) => <option key={d.id} value={d.id}>{d.nickname} · {d.serial_number}</option>)}</select></label><button className="secondary-button">Add device</button></form></div></section><section className="company-list">{data.companies.map((c) => <div className="panel company-card" key={c.id}><h2>{c.name}</h2><p className="muted">Members: {data.members.filter((m) => m.company_id === c.id).map((m) => m.profiles?.email || m.user_id).join(', ') || '—'}</p><p className="muted">Devices: {data.companyDevices.filter((cd) => cd.company_id === c.id).length}</p></div>)}</section></AppShell>;
+  function canManage(company) {
+    const role = roleFor(company.id);
+    return company.created_by === session.user.id || role === 'owner' || role === 'admin';
+  }
+
+  const ownedCompanies = data.companies.filter((c) => c.created_by === session.user.id || roleFor(c.id) === 'owner');
+  const adminCompanies = data.companies.filter((c) => canManage(c));
+  const sharedCompanies = data.companies.filter((c) => !canManage(c));
+  const ownedDevices = data.devices.filter((d) => d.owner_id === session.user.id);
+
+  async function createCompany(e) {
+    e.preventDefault();
+    const name = companyName.trim();
+    if (!name) return setMessage('Enter a company name.');
+    const { data: company, error } = await supabase.from('companies').insert({ name, created_by: session.user.id }).select().single();
+    if (error) return setMessage(error.message);
+    await supabase.from('company_members').insert({ company_id: company.id, user_id: session.user.id, role: 'owner', accepted_at: new Date().toISOString() });
+    setCompanyName('');
+    setMessage('Company created. You are the company admin/owner.');
+    data.refresh();
+  }
+
+  async function inviteUser(e) {
+    e.preventDefault();
+    if (!invite.companyId || !invite.email.trim()) return setMessage('Choose a company and enter an email.');
+    const email = invite.email.trim().toLowerCase();
+    const role = invite.role === 'admin' ? 'admin' : 'viewer';
+    const { data: profile } = await supabase.from('profiles').select('id,email').eq('email', email).maybeSingle();
+    if (profile) {
+      const { error } = await supabase.from('company_members').upsert({
+        company_id: invite.companyId,
+        user_id: profile.id,
+        role,
+        invited_by: session.user.id,
+        accepted_at: new Date().toISOString(),
+      }, { onConflict: 'company_id,user_id' });
+      setMessage(error ? error.message : `${email} added as ${role}.`);
+    } else {
+      const { error } = await supabase.from('company_invites').insert({ company_id: invite.companyId, email, role, invited_by: session.user.id });
+      setMessage(error ? error.message : `Invite saved for ${email} as ${role}. When that user signs up, an admin can add/accept them.`);
+    }
+    setInvite((current) => ({ ...current, email: '' }));
+    data.refresh();
+  }
+
+  async function updateMemberRole(member, role) {
+    const { error } = await supabase.from('company_members').update({ role }).eq('id', member.id);
+    setMessage(error ? error.message : 'Member role updated.');
+    data.refresh();
+  }
+
+  async function removeMember(member) {
+    if (member.user_id === session.user.id) return setMessage('You cannot remove yourself from a company here.');
+    if (!window.confirm('Remove this user from the company?')) return;
+    const { error } = await supabase.from('company_members').delete().eq('id', member.id);
+    setMessage(error ? error.message : 'Member removed from company.');
+    data.refresh();
+  }
+
+  async function attachDevice(e) {
+    e.preventDefault();
+    if (!deviceLink.companyId || !deviceLink.deviceId) return setMessage('Choose a company and a device.');
+    const { error } = await supabase.from('company_devices').insert({ company_id: deviceLink.companyId, device_id: deviceLink.deviceId, added_by: session.user.id });
+    setMessage(error ? error.message : 'Device added to company. Company members can now view it.');
+    data.refresh();
+  }
+
+  async function removeCompanyDevice(companyDeviceId) {
+    if (!window.confirm('Remove this device from this company? This does not delete the device or its data.')) return;
+    const { error } = await supabase.from('company_devices').delete().eq('id', companyDeviceId);
+    setMessage(error ? error.message : 'Device removed from company.');
+    data.refresh();
+  }
+
+  function companyMembers(companyId) {
+    return data.members.filter((m) => m.company_id === companyId);
+  }
+
+  function companyDevices(companyId) {
+    return data.companyDevices.filter((cd) => cd.company_id === companyId).map((cd) => ({
+      ...cd,
+      device: data.devices.find((d) => d.id === cd.device_id),
+    }));
+  }
+
+  return (
+    <AppShell session={session} title="Companies">
+      <section className="panel">
+        <p className="eyebrow">Organizations</p>
+        <h1>Companies and shared devices.</h1>
+        <p className="muted">Companies you create show under Managed companies. Admins can add users, assign other admins, and add their own devices to the company. Viewers can see company devices and data.</p>
+        <form className="form-grid" onSubmit={createCompany}>
+          <label>Company name<input value={companyName} onChange={(e) => setCompanyName(e.target.value)} placeholder="Customer company" /></label>
+          <button className="primary-button">Create company</button>
+        </form>
+        {message && <div className="alert info">{message}</div>}
+      </section>
+
+      <section className="summary-grid company-summary-grid">
+        <div className="summary-card"><span>Managed companies</span><strong>{adminCompanies.length}</strong></div>
+        <div className="summary-card"><span>Created by you</span><strong>{ownedCompanies.length}</strong></div>
+        <div className="summary-card"><span>Shared with you</span><strong>{sharedCompanies.length}</strong></div>
+        <div className="summary-card"><span>Your own devices</span><strong>{ownedDevices.length}</strong></div>
+      </section>
+
+      <section className="two-col">
+        <div className="panel">
+          <h2>Add user to managed company</h2>
+          <form className="form-stack" onSubmit={inviteUser}>
+            <label>Company<select value={invite.companyId} onChange={(e) => setInvite({ ...invite, companyId: e.target.value })}>
+              <option value="">Choose company</option>
+              {adminCompanies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select></label>
+            <label>Email<input value={invite.email} onChange={(e) => setInvite({ ...invite, email: e.target.value })} placeholder="user@example.com" /></label>
+            <label>Role<select value={invite.role} onChange={(e) => setInvite({ ...invite, role: e.target.value })}>
+              <option value="viewer">Viewer - can see devices/data</option>
+              <option value="admin">Admin - can add users/devices</option>
+            </select></label>
+            <button className="secondary-button">Invite/add user</button>
+          </form>
+        </div>
+        <div className="panel">
+          <h2>Add your device to company</h2>
+          <form className="form-stack" onSubmit={attachDevice}>
+            <label>Company<select value={deviceLink.companyId} onChange={(e) => setDeviceLink({ ...deviceLink, companyId: e.target.value })}>
+              <option value="">Choose company</option>
+              {adminCompanies.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+            </select></label>
+            <label>Your devices<select value={deviceLink.deviceId} onChange={(e) => setDeviceLink({ ...deviceLink, deviceId: e.target.value })}>
+              <option value="">Choose device</option>
+              {ownedDevices.map((d) => <option key={d.id} value={d.id}>{d.nickname} · {d.serial_number}</option>)}
+            </select></label>
+            <button className="secondary-button">Add device</button>
+          </form>
+          <p className="muted small-note">Admins can add devices they personally own. Company members then see the shared device, readings, datalog, and alarm history.</p>
+        </div>
+      </section>
+
+      <section className="section-head"><h2>Managed companies</h2><span>{adminCompanies.length}</span></section>
+      <section className="company-list">
+        {adminCompanies.length ? adminCompanies.map((c) => (
+          <div className="panel company-card" key={c.id}>
+            <div className="company-card-head"><div><h2>{c.name}</h2><p className="muted">Your role: {roleFor(c.id) || (c.created_by === session.user.id ? 'owner' : 'admin')}</p></div><span className="status-pill connected">Admin</span></div>
+            <div className="company-section"><strong>Members</strong>{companyMembers(c.id).length ? companyMembers(c.id).map((m) => (
+              <div className="member-row" key={m.id}>
+                <div><span>{m.profiles?.email || m.user_id}</span><small>{m.accepted_at ? 'Accepted member' : 'Pending'}</small></div>
+                <select value={m.role} onChange={(e) => updateMemberRole(m, e.target.value)} disabled={m.user_id === session.user.id && m.role === 'owner'}>
+                  <option value="viewer">Viewer</option>
+                  <option value="admin">Admin</option>
+                  <option value="owner">Owner</option>
+                </select>
+                <button className="danger-button slim" onClick={() => removeMember(m)} disabled={m.user_id === session.user.id}>Remove</button>
+              </div>
+            )) : <p className="muted">No members yet.</p>}</div>
+            <div className="company-section"><strong>Devices</strong>{companyDevices(c.id).length ? companyDevices(c.id).map((cd) => (
+              <div className="member-row" key={cd.id}>
+                <div><span>{cd.device?.nickname || 'Unknown device'}</span><small>{cd.device?.serial_number || cd.device_id}</small></div>
+                <button className="danger-button slim" onClick={() => removeCompanyDevice(cd.id)}>Remove from company</button>
+              </div>
+            )) : <p className="muted">No devices added yet.</p>}</div>
+          </div>
+        )) : <div className="empty-state"><h3>No managed companies yet</h3><p>Create a company or ask an admin to make you an admin.</p></div>}
+      </section>
+
+      <section className="section-head"><h2>Shared with me</h2><span>{sharedCompanies.length}</span></section>
+      <section className="company-list">
+        {sharedCompanies.length ? sharedCompanies.map((c) => (
+          <div className="panel company-card" key={c.id}>
+            <div className="company-card-head"><div><h2>{c.name}</h2><p className="muted">Your role: {roleFor(c.id) || 'viewer'}</p></div><span className="status-pill disconnected">Viewer</span></div>
+            <p className="muted">Devices visible to you: {companyDevices(c.id).length}</p>
+            <div className="chip-row">{companyDevices(c.id).map((cd) => cd.device ? <NavLink key={cd.id} to={`/devices/${cd.device.id}`}>{cd.device.nickname} · {cd.device.serial_number}</NavLink> : <span key={cd.id}>Unknown device</span>)}</div>
+          </div>
+        )) : <div className="empty-state"><h3>No shared companies</h3><p>Companies where you are only a viewer will appear here.</p></div>}
+      </section>
+    </AppShell>
+  );
 }
 
 function IngestPage({ session, data }) {
@@ -365,27 +543,168 @@ function IngestPage({ session, data }) {
   const [secret, setSecret] = useState('');
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
+  const [liveRunning, setLiveRunning] = useState(false);
+  const [liveCount, setLiveCount] = useState(0);
+  const [liveNote, setLiveNote] = useState('');
+  const latestJsonRef = useRef(jsonText);
+  const liveTickRef = useRef(0);
+
+  useEffect(() => { latestJsonRef.current = jsonText; }, [jsonText]);
+
   function loadSample(type) {
-    const base = { ...samplePayload, TS: new Date().toLocaleString('en-US', { year: '2-digit', month: '2-digit', day: '2-digit', hour12: false }).replace(',', '') };
+    const base = { ...samplePayload, TS: deviceTimestamp() };
     if (type === 'high') base.Event1 = 'PRESSURE R1S1 HIGH -4.200 ALARM';
     if (type === 'low') base.Event1 = 'PRESSURE R1S1 LOW -28.200 ALARM';
-    if (type === 'ok') base.Event1 = 'PRESSURE R1S1 OK -13.860 NORMAL';
+    if (type === 'ok') base.Event1 = 'PRESSURE R1S1 INTERVAL -13.860 SET MENU PASSWORD';
     setJsonText(JSON.stringify(base, null, 2));
   }
-  async function ingest(e) {
-    e.preventDefault(); setError(''); setResult(null);
-    try {
-      const res = await fetch('/.netlify/functions/ingest-device', { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-ingest-secret': secret }, body: jsonText });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error || 'Ingest failed');
-      setResult(body); data.refresh();
-    } catch (err) { setError(err.message); }
+
+  function buildLivePayload() {
+    let base = samplePayload;
+    try { base = JSON.parse(latestJsonRef.current || '{}'); } catch { base = samplePayload; }
+    liveTickRef.current += 1;
+    const tick = liveTickRef.current;
+    const pressureBase = -14.2 + Math.sin(tick / 4) * 1.2;
+    const pressure = randomBetween(pressureBase - 0.45, pressureBase + 0.45, 3).toFixed(3);
+    const temp = randomBetween(20.4, 22.6, 1).toFixed(1);
+    const humidity = randomBetween(39, 49, 1).toFixed(1);
+    const particles = Math.round(randomBetween(28, 115, 0));
+    const ach = randomBetween(5.5, 7.4, 1).toFixed(1);
+
+    return {
+      unique_id: String(base.unique_id || base.serial || base.serial_number || samplePayload.unique_id),
+      ...(base.validation_code ? { validation_code: base.validation_code } : {}),
+      JobNo: String(base.JobNo || '41399'),
+      TS: deviceTimestamp(),
+      Count: '5',
+      RoomNo1: '1',
+      Event1: `PRESSURE R1S1 INTERVAL ${pressure} SET MENU PASSWORD`,
+      UpLim1: '-6.494 SET MENU PASSWORD',
+      LowLim1: '-23.988 SET MENU PASSWORD',
+      RoomNo2: '1',
+      Event2: `TEMPERATURE R1S2 INTERVAL ${temp}`,
+      UpLim2: '26.0',
+      LowLim2: '18.0',
+      RoomNo3: '1',
+      Event3: `HUMIDITY R1S3 INTERVAL ${humidity}`,
+      UpLim3: '60.0',
+      LowLim3: '30.0',
+      RoomNo4: '1',
+      Event4: `PARTICLE R1S4 INTERVAL ${particles}`,
+      UpLim4: '250',
+      LowLim4: '0',
+      RoomNo5: '1',
+      Event5: `ACH R1S5 INTERVAL ${ach}`,
+      UpLim5: '12.0',
+      LowLim5: '3.0',
+    };
   }
-  return <AppShell session={session} title="Live Ingest"><section className="hero-card compact-hero"><div><p className="eyebrow">Real endpoint tester</p><h1>Send device JSON to Supabase.</h1><p className="muted">This posts to the Netlify Function at <strong>/.netlify/functions/ingest-device</strong>. Real devices can post to the same URL.</p></div></section><section className="panel"><div className="quick-buttons"><button className="secondary-button" onClick={() => loadSample('ok')}>OK sample</button><button className="secondary-button" onClick={() => loadSample('high')}>High alarm sample</button><button className="secondary-button" onClick={() => loadSample('low')}>Low alarm sample</button></div><form onSubmit={ingest} className="form-stack"><label>Ingest secret<input value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="DEVICE_INGEST_SECRET" /></label><label>Device JSON<textarea value={jsonText} onChange={(e) => setJsonText(e.target.value)} rows="14" /></label><button className="primary-button">Post to live ingest endpoint</button></form>{error && <div className="alert danger">{error}</div>}{result && <div className="alert info">Ingested {result.readingCount} reading(s) for serial {result.serial}. Device status: {result.deviceStatus}</div>}</section><section className="panel"><div className="section-head"><h2>Notification log</h2><span>{data.logs.length}</span></div><div className="table-scroll"><table><thead><tr><th>Time</th><th>Channel</th><th>State</th><th>Status</th><th>Recipients</th></tr></thead><tbody>{data.logs.map((n) => <tr key={n.id}><td>{new Date(n.created_at).toLocaleString()}</td><td>{n.channel}</td><td>{n.alarm_state}</td><td>{n.status}</td><td>{(n.recipients || []).join(', ') || '—'}</td></tr>)}</tbody></table></div></section></AppShell>;
+
+  async function postPayload(payload) {
+    const bodyText = typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2);
+    const res = await fetch('/.netlify/functions/ingest-device', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-ingest-secret': secret },
+      body: bodyText,
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error || 'Ingest failed');
+    setResult(body);
+    data.refresh();
+    return body;
+  }
+
+  async function ingest(e) {
+    e.preventDefault();
+    setError('');
+    setResult(null);
+    try {
+      await postPayload(jsonText);
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  useEffect(() => {
+    if (!liveRunning) return undefined;
+    let stopped = false;
+
+    async function sendLive() {
+      if (stopped) return;
+      setError('');
+      const payload = buildLivePayload();
+      setJsonText(JSON.stringify(payload, null, 2));
+      try {
+        const body = await postPayload(payload);
+        setLiveCount((count) => count + 1);
+        setLiveNote(`Last live sample sent at ${new Date().toLocaleTimeString()} for serial ${body.serial}.`);
+      } catch (err) {
+        setError(err.message);
+        setLiveRunning(false);
+      }
+    }
+
+    sendLive();
+    const timer = window.setInterval(sendLive, 60000);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [liveRunning, secret]);
+
+  return (
+    <AppShell session={session} title="Live Ingest">
+      <section className="hero-card compact-hero">
+        <div>
+          <p className="eyebrow">Real endpoint tester</p>
+          <h1>Send device JSON to Supabase.</h1>
+          <p className="muted">This posts to the Netlify Function at <strong>/.netlify/functions/ingest-device</strong>. Real devices can post to the same URL.</p>
+        </div>
+      </section>
+
+      <section className="panel live-simulator-panel">
+        <div className="section-head">
+          <div>
+            <p className="eyebrow">Simulator</p>
+            <h2>Believable live data</h2>
+          </div>
+          <StatusPill status={liveRunning ? 'connected' : 'ok'} />
+        </div>
+        <p className="muted">Start this while the page is open to send believable pressure, temperature, humidity, particle, and ACH interval readings once every minute. It sends one immediately, then every 60 seconds.</p>
+        <div className="quick-buttons">
+          <button className={liveRunning ? 'danger-button' : 'primary-button'} type="button" onClick={() => setLiveRunning((running) => !running)}>
+            {liveRunning ? 'Stop live data' : 'Start live data'}
+          </button>
+          <span className="live-count">Sent {liveCount} live sample{liveCount === 1 ? '' : 's'}</span>
+        </div>
+        {liveNote && <div className="alert info">{liveNote}</div>}
+      </section>
+
+      <section className="panel">
+        <div className="quick-buttons">
+          <button className="secondary-button" type="button" onClick={() => loadSample('ok')}>Interval / OK sample</button>
+          <button className="secondary-button" type="button" onClick={() => loadSample('high')}>High alarm sample</button>
+          <button className="secondary-button" type="button" onClick={() => loadSample('low')}>Low alarm sample</button>
+        </div>
+        <form onSubmit={ingest} className="form-stack">
+          <label>Ingest secret<input value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="DEVICE_INGEST_SECRET" /></label>
+          <label>Device JSON<textarea value={jsonText} onChange={(e) => setJsonText(e.target.value)} rows="16" /></label>
+          <button className="primary-button">Post to live ingest endpoint</button>
+        </form>
+        {error && <div className="alert danger">{error}</div>}
+        {result && <div className="alert info">Ingested {result.readingCount} reading(s) for serial {result.serial}. Device status: {result.deviceStatus}</div>}
+      </section>
+
+      <section className="panel">
+        <div className="section-head"><h2>Notification log</h2><span>{data.logs.length}</span></div>
+        <div className="table-scroll"><table><thead><tr><th>Time</th><th>Channel</th><th>State</th><th>Status</th><th>Recipients</th></tr></thead><tbody>{data.logs.map((n) => <tr key={n.id}><td>{new Date(n.created_at).toLocaleString()}</td><td>{n.channel}</td><td>{n.alarm_state}</td><td>{n.status}</td><td>{(n.recipients || []).join(', ') || '—'}</td></tr>)}</tbody></table></div>
+      </section>
+    </AppShell>
+  );
 }
 
 function SettingsPage({ session }) {
-  return <AppShell session={session} title="Settings"><section className="panel"><p className="eyebrow">Cloud setup</p><h1>Abatement Link v2.2</h1><p>This build uses Supabase Auth, Supabase Postgres, Supabase Realtime, and a Netlify Function for device JSON ingest.</p><div className="alert info">SMS is intentionally not functional yet. The database/UI is ready for the future Plivo integration.</div></section><section className="panel"><h2>Required setup</h2><ol className="roadmap"><li>Run <code>database/abatement-link-supabase-schema.sql</code> in Supabase SQL Editor.</li><li>Add Netlify env vars from <code>.env.example</code>.</li><li>Enable email/password auth in Supabase.</li><li>Deploy and test with the Ingest page.</li></ol></section><section className="panel"><h2>Browser reset</h2><p className="muted">Use this if a previous PWA/service-worker version or stuck Supabase session keeps sending this browser to a blank or bad page.</p><button className="secondary-button" type="button" onClick={() => window.clearAbatementLinkBrowserState?.()}>Clear browser data and reload</button></section></AppShell>;
+  return <AppShell session={session} title="Settings"><section className="panel"><p className="eyebrow">Cloud setup</p><h1>Abatement Link v2.3</h1><p>This build uses Supabase Auth, Supabase Postgres, Supabase Realtime, and a Netlify Function for device JSON ingest.</p><div className="alert info">SMS is intentionally not functional yet. The database/UI is ready for the future Plivo integration.</div></section><section className="panel"><h2>Required setup</h2><ol className="roadmap"><li>Run <code>database/abatement-link-supabase-schema.sql</code> in Supabase SQL Editor.</li><li>Add Netlify env vars from <code>.env.example</code>.</li><li>Enable email/password auth in Supabase.</li><li>Deploy and test with the Ingest page.</li></ol></section><section className="panel"><h2>Browser reset</h2><p className="muted">Use this if a previous PWA/service-worker version or stuck Supabase session keeps sending this browser to a blank or bad page.</p><button className="secondary-button" type="button" onClick={() => window.clearAbatementLinkBrowserState?.()}>Clear browser data and reload</button></section></AppShell>;
 }
 
 export default function App() {
