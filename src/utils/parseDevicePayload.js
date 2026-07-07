@@ -11,6 +11,12 @@ const metricAliases = [
   ['AIRFLOW', 'velocity'],
 ];
 
+function clampRoomSensor(value) {
+  const number = Number(value || 1);
+  if (!Number.isFinite(number)) return 1;
+  return Math.min(2, Math.max(1, number));
+}
+
 export function parseDeviceTimestamp(ts) {
   if (!ts) return new Date();
   const match = String(ts).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4}),(\d{1,2}):(\d{2}):(\d{2})/);
@@ -40,18 +46,25 @@ function getRoomSensor(eventText, fallbackRoom) {
   const upper = String(eventText || '').toUpperCase();
   const match = upper.match(/R(\d+)S(\d+)/);
   return {
-    room: match ? Number(match[1]) : Number(fallbackRoom || 1),
-    sensor: match ? Number(match[2]) : 1,
+    room: clampRoomSensor(match ? match[1] : fallbackRoom),
+    sensor: clampRoomSensor(match ? match[2] : 1),
   };
 }
 
 function alarmState(value, upLimit, lowLimit, eventText) {
   const upper = String(eventText || '').toUpperCase();
+
+  // Real device alarm strings. These should override any numeric guesswork.
+  if (upper.includes('OK ALARM') || upper.includes('RETURN TO OK')) return 'ok';
+  if (upper.includes('HIGH ALARM')) return 'high';
+  if (upper.includes('LOW ALARM')) return 'low';
+
   if (upper.includes('INTERVAL')) {
     if (value !== null && upLimit !== null && value > upLimit) return 'high';
     if (value !== null && lowLimit !== null && value < lowLimit) return 'low';
     return 'ok';
   }
+
   if (upper.includes('HIGH')) return 'high';
   if (upper.includes('LOW')) return 'low';
   if (upper.includes('OK') || upper.includes('NORMAL')) return 'ok';
@@ -103,7 +116,10 @@ export function connectionStatus(device) {
 }
 
 export function metricLabel(metric) {
-  return {
+  const value = String(metric || 'unknown');
+  const isSecondSensor = value.endsWith('2');
+  const base = isSecondSensor ? value.slice(0, -1) : value;
+  const label = {
     pressure: 'Pressure',
     temperature: 'Temp',
     humidity: 'Humidity',
@@ -111,10 +127,13 @@ export function metricLabel(metric) {
     ach: 'ACH',
     velocity: 'Velocity',
     unknown: 'Unknown',
-  }[metric] || metric;
+  }[base] || base;
+  return `${label}${isSecondSensor ? '2' : ''}`;
 }
 
 export function metricIcon(metric) {
+  const value = String(metric || 'unknown');
+  const base = value.endsWith('2') ? value.slice(0, -1) : value;
   return {
     pressure: '↕',
     temperature: '℃',
@@ -123,5 +142,5 @@ export function metricIcon(metric) {
     ach: '⟳',
     velocity: '➜',
     unknown: '?',
-  }[metric] || '•';
+  }[base] || '•';
 }

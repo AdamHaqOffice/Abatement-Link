@@ -21,7 +21,7 @@ export default class ErrorBoundary extends React.Component {
     return (
       <main className="login-screen">
         <section className="login-card">
-          <img className="login-logo" src="/abatement-link-mark.svg" alt="Abatement Link" />
+          <img className="login-logo" src="/abatement-tech-tagline.png" alt="Abatement Technologies" />
           <p className="eyebrow">Startup error</p>
           <h1>Abatement Link hit a page error.</h1>
           <p className="muted">This screen replaces the old blank page so we can see what failed.</p>

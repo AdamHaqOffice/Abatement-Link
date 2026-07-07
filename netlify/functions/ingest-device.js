@@ -1,9 +1,16 @@
 import { createClient } from '@supabase/supabase-js';
+import webpush from 'web-push';
 
 const metricAliases = [
   ['PRESSURE', 'pressure'], ['TEMP', 'temperature'], ['TEMPERATURE', 'temperature'], ['HUM', 'humidity'],
   ['HUMIDITY', 'humidity'], ['PART', 'particles'], ['PARTICLE', 'particles'], ['ACH', 'ach'], ['VELOCITY', 'velocity'], ['AIRFLOW', 'velocity'],
 ];
+
+function clampRoomSensor(value) {
+  const number = Number(value || 1);
+  if (!Number.isFinite(number)) return 1;
+  return Math.min(2, Math.max(1, number));
+}
 
 function firstNumber(value) {
   const match = String(value ?? '').match(/-?\d+(?:\.\d+)?/);
@@ -33,18 +40,25 @@ function metricFromEvent(eventText) {
 function roomSensor(eventText, fallbackRoom) {
   const match = String(eventText || '').toUpperCase().match(/R(\d+)S(\d+)/);
   return {
-    room_no: match ? Number(match[1]) : Number(fallbackRoom || 1),
-    sensor_no: match ? Number(match[2]) : 1,
+    room_no: clampRoomSensor(match ? match[1] : fallbackRoom),
+    sensor_no: clampRoomSensor(match ? match[2] : 1),
   };
 }
 
 function alarmState(value, upperLimit, lowerLimit, eventText) {
   const upper = String(eventText || '').toUpperCase();
+
+  // Real device alarm strings. These should override any numeric guesswork.
+  if (upper.includes('OK ALARM') || upper.includes('RETURN TO OK')) return 'ok';
+  if (upper.includes('HIGH ALARM')) return 'high';
+  if (upper.includes('LOW ALARM')) return 'low';
+
   if (upper.includes('INTERVAL')) {
     if (value !== null && upperLimit !== null && value > upperLimit) return 'high';
     if (value !== null && lowerLimit !== null && value < lowerLimit) return 'low';
     return 'ok';
   }
+
   if (upper.includes('HIGH')) return 'high';
   if (upper.includes('LOW')) return 'low';
   if (upper.includes('OK') || upper.includes('NORMAL')) return 'ok';
@@ -86,6 +100,87 @@ function parsePayload(payload) {
   return { serial, jobNo, deviceTs, validationCode, readings };
 }
 
+
+function configureWebPush() {
+  const publicKey = process.env.VAPID_PUBLIC_KEY;
+  const privateKey = process.env.VAPID_PRIVATE_KEY;
+  if (!publicKey || !privateKey) return false;
+  const subject = process.env.VAPID_SUBJECT || 'mailto:support@abatement.ca';
+  webpush.setVapidDetails(subject, publicKey, privateKey);
+  return true;
+}
+
+function notificationTitle(state) {
+  if (state === 'high') return 'Abatement Link: HIGH alarm';
+  if (state === 'low') return 'Abatement Link: LOW alarm';
+  return 'Abatement Link: returned to OK';
+}
+
+function notificationBody(device, alarm, state) {
+  const label = device?.nickname || device?.serial_number || 'Device';
+  const metric = String(alarm?.metric || 'reading').replace(/_/g, ' ');
+  const room = alarm?.room_no ? `Room ${alarm.room_no}` : 'Room';
+  const sensor = alarm?.sensor_no ? `S${alarm.sensor_no}` : '';
+  const value = alarm?.value ?? '—';
+  return `${label} · ${room}${sensor ? ` ${sensor}` : ''} · ${metric} ${value}`;
+}
+
+async function sendPhonePushes(db, log, device, alarm, state, vapidReady) {
+  if (!vapidReady) {
+    await db.from('notification_logs').update({ status: 'no-vapid-keys' }).eq('id', log.id);
+    return;
+  }
+
+  const { data: subscriptions, error } = await db.from('push_subscriptions')
+    .select('*')
+    .eq('user_id', log.user_id)
+    .eq('enabled', true);
+
+  if (error) {
+    await db.from('notification_logs').update({ status: 'push-subscription-error', provider_response: { error: error.message } }).eq('id', log.id);
+    return;
+  }
+
+  if (!subscriptions?.length) {
+    await db.from('notification_logs').update({ status: 'no-phone-subscription' }).eq('id', log.id);
+    return;
+  }
+
+  const payload = JSON.stringify({
+    title: notificationTitle(state),
+    body: notificationBody(device, alarm, state),
+    icon: '/icon-192.png',
+    badge: '/favicon.png',
+    tag: `alarm-${device.id}-${alarm.metric || 'metric'}-r${alarm.room_no || 0}-s${alarm.sensor_no || 0}`,
+    requireInteraction: state === 'high' || state === 'low',
+    data: { url: `/devices/${device.id}`, deviceId: device.id, alarmId: alarm.id, state },
+  });
+
+  const results = [];
+  for (const sub of subscriptions) {
+    try {
+      await webpush.sendNotification({
+        endpoint: sub.endpoint,
+        keys: { p256dh: sub.p256dh, auth: sub.auth },
+      }, payload);
+      results.push({ endpoint: sub.endpoint, ok: true });
+    } catch (err) {
+      const statusCode = err.statusCode || err.status;
+      results.push({ endpoint: sub.endpoint, ok: false, statusCode, message: err.message });
+      if (statusCode === 404 || statusCode === 410) {
+        await db.from('push_subscriptions').update({ enabled: false, updated_at: new Date().toISOString() }).eq('id', sub.id);
+      }
+    }
+  }
+
+  const sent = results.filter((item) => item.ok).length;
+  await db.from('notification_logs').update({
+    status: sent ? 'sent-phone-push' : 'push-send-failed',
+    recipients: subscriptions.map((sub) => sub.endpoint),
+    provider_response: { sent, attempted: results.length, results },
+  }).eq('id', log.id);
+}
+
 function json(statusCode, body) {
   return {
     statusCode,
@@ -124,7 +219,8 @@ export const handler = async (event) => {
   const now = new Date().toISOString();
   const latestMetrics = { ...(device.latest_metrics || {}) };
   parsed.readings.forEach((reading) => {
-    latestMetrics[reading.metric] = {
+    const metricKey = Number(reading.sensor_no) === 2 ? `${reading.metric}2` : reading.metric;
+    latestMetrics[metricKey] = {
       value: reading.value,
       timestamp: reading.device_ts,
       room: reading.room_no,
@@ -185,14 +281,67 @@ export const handler = async (event) => {
 };
 
 async function queueNotifications(db, deviceId, alarm, state) {
-  const { data: rules } = await db.from('notification_rules').select('*').eq('device_id', deviceId);
-  const logs = [];
-  for (const rule of rules || []) {
-    const extraEmails = Array.isArray(rule.extra_emails) ? rule.extra_emails : [];
-    const stateKey = state === 'high' ? 'high' : state === 'low' ? 'low' : 'ok';
-    if (rule[`push_${stateKey}`]) logs.push({ device_id: deviceId, alarm_id: alarm.id, user_id: rule.user_id, channel: 'push', alarm_state: state, recipients: [], status: 'queued' });
-    if (rule[`email_${stateKey}`]) logs.push({ device_id: deviceId, alarm_id: alarm.id, user_id: rule.user_id, channel: 'email', alarm_state: state, recipients: extraEmails, status: 'queued' });
-    if (rule[`sms_${stateKey}`]) logs.push({ device_id: deviceId, alarm_id: alarm.id, user_id: rule.user_id, channel: 'sms', alarm_state: state, recipients: [], status: 'future-plivo' });
+  const stateKey = state === 'high' ? 'high' : state === 'low' ? 'low' : 'ok';
+
+  // Alarm-bell / push notifications are default-on for:
+  // 1) the user who owns/added the device
+  // 2) every accepted user in a company that contains this device
+  // A notification_rules row overrides those defaults for that specific user.
+  const { data: device } = await db.from('devices').select('id, owner_id, nickname, serial_number, model').eq('id', deviceId).maybeSingle();
+  const stakeholderIds = new Set();
+  if (device?.owner_id) stakeholderIds.add(device.owner_id);
+
+  const { data: companyLinks } = await db.from('company_devices').select('company_id').eq('device_id', deviceId);
+  const companyIds = [...new Set((companyLinks || []).map((link) => link.company_id).filter(Boolean))];
+  if (companyIds.length) {
+    const { data: members } = await db.from('company_members')
+      .select('user_id')
+      .in('company_id', companyIds)
+      .not('accepted_at', 'is', null);
+    for (const member of members || []) {
+      if (member.user_id) stakeholderIds.add(member.user_id);
+    }
   }
-  if (logs.length) await db.from('notification_logs').insert(logs);
+
+  // Include anyone who already created a rule for the device, even if company sharing changes later.
+  const { data: rules } = await db.from('notification_rules').select('*').eq('device_id', deviceId);
+  for (const rule of rules || []) {
+    if (rule.user_id) stakeholderIds.add(rule.user_id);
+  }
+
+  const rulesByUser = new Map((rules || []).map((rule) => [rule.user_id, rule]));
+  const logs = [];
+
+  for (const userId of stakeholderIds) {
+    const savedRule = rulesByUser.get(userId);
+    const rule = savedRule || {
+      user_id: userId,
+      push_high: true,
+      push_low: true,
+      push_ok: true,
+      email_high: false,
+      email_low: false,
+      email_ok: false,
+      sms_high: false,
+      sms_low: false,
+      sms_ok: false,
+      extra_emails: [],
+    };
+    const extraEmails = Array.isArray(rule.extra_emails) ? rule.extra_emails : [];
+
+    if (rule[`push_${stateKey}`]) logs.push({ device_id: deviceId, alarm_id: alarm.id, user_id: userId, channel: 'push', alarm_state: state, recipients: [], status: savedRule ? 'queued' : 'default-on' });
+    if (rule[`email_${stateKey}`]) logs.push({ device_id: deviceId, alarm_id: alarm.id, user_id: userId, channel: 'email', alarm_state: state, recipients: extraEmails, status: 'queued' });
+    if (rule[`sms_${stateKey}`]) logs.push({ device_id: deviceId, alarm_id: alarm.id, user_id: userId, channel: 'sms', alarm_state: state, recipients: [], status: 'future-plivo' });
+  }
+
+  if (!logs.length) return;
+
+  const { data: insertedLogs } = await db.from('notification_logs').insert(logs).select('*');
+  const vapidReady = configureWebPush();
+
+  for (const log of insertedLogs || []) {
+    if (log.channel === 'push') {
+      await sendPhonePushes(db, log, device, alarm, state, vapidReady);
+    }
+  }
 }

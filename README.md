@@ -93,10 +93,41 @@ To validate a device from ingest, include:
 This version disables service-worker/offline caching while the Supabase live-data build is being tested. This prevents old cached bundles from showing a blank page after deploys. It also adds a visible startup error screen so browser runtime errors are no longer silent blank pages.
 
 
-## v2.4 notes
+## v2.7 notes
 
 - Fixed parser bug where `R1S1` numbers could be mistaken for the reading value.
 - Datalog now separates event type from alarm state.
 - INTERVAL data inside limits is stored as OK, not High.
 - Ingest page includes Start Live Data simulator that posts believable readings every minute while the page is open.
 - Ingest endpoint accepts secret by `x-ingest-secret` header, `secret` query string, or `secret` field in JSON body.
+
+
+## v2.8 alarm simulation update
+
+- Parses real device alarm strings: `HIGH ALARM`, `LOW ALARM`, and `OK ALARM`.
+- `OK ALARM` resolves active alarms after the value returns to range.
+- The live-data simulator now sends mostly normal `INTERVAL` records, occasionally sends out-of-range `HIGH ALARM` or `LOW ALARM`, then sends an `OK ALARM` recovery sample.
+- No Supabase SQL patch is required for this update.
+
+## v2.11 real phone push + device search
+
+New in v2.11:
+- Real browser/phone push notifications using Web Push/VAPID.
+- `/push-sw.js` service worker for alarm notifications.
+- Ingest function sends phone pushes for enabled High, Low, and OK alarm notifications.
+- Device page notification settings now has an Enable phone alerts button.
+- Devices page includes a typeahead filter beside Your devices for company, device type, name, and serial number.
+
+Existing Supabase projects must run:
+`database/abatement-link-v2-11-real-push-patch.sql`
+
+New Netlify env vars:
+- `VITE_VAPID_PUBLIC_KEY`
+- `VAPID_PUBLIC_KEY`
+- `VAPID_PRIVATE_KEY`
+- `VAPID_SUBJECT=mailto:support@abatement.ca`
+
+To generate VAPID keys without local Node/npm after deploying this build once, open:
+`https://YOUR-SITE.netlify.app/.netlify/functions/generate-vapid?secret=YOUR_DEVICE_INGEST_SECRET`
+
+Then copy the returned values into Netlify env vars and clear cache/redeploy.

@@ -49,19 +49,5 @@ createRoot(document.getElementById('root')).render(
   </React.StrictMode>
 );
 
-// During the live database build, avoid stale PWA caches causing blank pages after deploys.
-// We will turn PWA caching back on after the Supabase version is stable.
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', async () => {
-    try {
-      const registrations = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(registrations.map((registration) => registration.unregister()));
-      if ('caches' in window) {
-        const keys = await caches.keys();
-        await Promise.all(keys.map((key) => caches.delete(key)));
-      }
-    } catch (error) {
-      console.warn('Service worker cleanup skipped:', error);
-    }
-  });
-}
+// v2.11 keeps service workers available because real phone push notifications
+// require /push-sw.js. The manual ?reset=1 flow still clears old workers/caches.

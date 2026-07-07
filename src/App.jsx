@@ -3,17 +3,120 @@ import { Navigate, NavLink, Route, Routes, useNavigate, useParams } from 'react-
 import { supabase, isSupabaseConfigured } from './lib/supabaseClient.js';
 import { connectionStatus, metricIcon, metricLabel } from './utils/parseDevicePayload.js';
 
-const metrics = ['pressure', 'temperature', 'humidity', 'particles', 'ach', 'velocity'];
+const metrics = ['pressure', 'pressure2', 'temperature', 'temperature2', 'humidity', 'humidity2', 'particles', 'particles2', 'ach', 'ach2', 'velocity', 'velocity2'];
 const samplePayload = {
   unique_id: '14374082',
   JobNo: '41399',
   TS: '03/24/26,03:10:00',
-  Count: '1',
+  Count: '10',
   RoomNo1: '1',
   Event1: 'PRESSURE R1S1 INTERVAL -13.860 SET MENU PASSWORD',
   UpLim1: '-6.494 SET MENU PASSWORD',
   LowLim1: '-23.988 SET MENU PASSWORD',
+  RoomNo2: '1',
+  Event2: 'TEMPERATURE R1S1 INTERVAL 21.4',
+  UpLim2: '26.0',
+  LowLim2: '18.0',
+  RoomNo3: '1',
+  Event3: 'HUMIDITY R1S1 INTERVAL 44.1',
+  UpLim3: '60.0',
+  LowLim3: '30.0',
+  RoomNo4: '1',
+  Event4: 'PARTICLE R1S1 INTERVAL 72',
+  UpLim4: '250',
+  LowLim4: '0',
+  RoomNo5: '1',
+  Event5: 'ACH R1S2 INTERVAL 6.3',
+  UpLim5: '12.0',
+  LowLim5: '3.0',
+  RoomNo6: '2',
+  Event6: 'PRESSURE R2S1 INTERVAL -12.540 SET MENU PASSWORD',
+  UpLim6: '-6.494 SET MENU PASSWORD',
+  LowLim6: '-23.988 SET MENU PASSWORD',
+  RoomNo7: '2',
+  Event7: 'TEMPERATURE R2S1 INTERVAL 21.8',
+  UpLim7: '26.0',
+  LowLim7: '18.0',
+  RoomNo8: '2',
+  Event8: 'HUMIDITY R2S1 INTERVAL 45.2',
+  UpLim8: '60.0',
+  LowLim8: '30.0',
+  RoomNo9: '2',
+  Event9: 'PARTICLE R2S2 INTERVAL 88',
+  UpLim9: '250',
+  LowLim9: '0',
+  RoomNo10: '2',
+  Event10: 'ACH R2S1 INTERVAL 5.9',
+  UpLim10: '12.0',
+  LowLim10: '3.0',
 };
+
+const SUPPORT_PORTAL_URL = import.meta.env.VITE_SUPPORT_PORTAL_URL || 'https://abatementpartnersupport.freshdesk.com/support/home';
+const MONSUITE_URL = import.meta.env.VITE_MONSUITE_URL || 'https://monsuite.netlify.app';
+const VAPID_PUBLIC_KEY = import.meta.env.VITE_VAPID_PUBLIC_KEY || '';
+
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = window.atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i += 1) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
+}
+
+function phonePushAvailable() {
+  return Boolean('serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window);
+}
+
+async function getPushRegistration() {
+  const registration = await navigator.serviceWorker.register('/push-sw.js');
+  await navigator.serviceWorker.ready;
+  return registration;
+}
+
+async function getBrowserPushSubscription() {
+  if (!phonePushAvailable()) return null;
+  const registration = await getPushRegistration();
+  return registration.pushManager.getSubscription();
+}
+
+async function enablePhonePushForUser(userId) {
+  if (!phonePushAvailable()) throw new Error('This browser does not support web push notifications.');
+  if (!VAPID_PUBLIC_KEY) throw new Error('Missing VITE_VAPID_PUBLIC_KEY in Netlify. Add the public push key and redeploy.');
+  const permission = await Notification.requestPermission();
+  if (permission !== 'granted') throw new Error('Notification permission was not granted on this device.');
+  const registration = await getPushRegistration();
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+    });
+  }
+  const json = subscription.toJSON();
+  const { error } = await supabase.from('push_subscriptions').upsert({
+    user_id: userId,
+    endpoint: subscription.endpoint,
+    p256dh: json.keys?.p256dh,
+    auth: json.keys?.auth,
+    enabled: true,
+    user_agent: navigator.userAgent,
+    updated_at: new Date().toISOString(),
+  }, { onConflict: 'endpoint' });
+  if (error) throw error;
+  return subscription;
+}
+
+async function disablePhonePushForCurrentBrowser(userId) {
+  const subscription = await getBrowserPushSubscription();
+  if (subscription) {
+    await supabase.from('push_subscriptions').update({ enabled: false, updated_at: new Date().toISOString() }).eq('endpoint', subscription.endpoint).eq('user_id', userId);
+    await subscription.unsubscribe();
+  } else {
+    await supabase.from('push_subscriptions').update({ enabled: false, updated_at: new Date().toISOString() }).eq('user_id', userId);
+  }
+}
 
 function pad2(value) {
   return String(value).padStart(2, '0');
@@ -31,6 +134,9 @@ function randomBetween(min, max, decimals = 3) {
 
 function eventTypeFromText(eventText) {
   const upper = String(eventText || '').toUpperCase();
+  if (upper.includes('OK ALARM') || upper.includes('RETURN TO OK')) return 'OK alarm';
+  if (upper.includes('HIGH ALARM')) return 'High alarm';
+  if (upper.includes('LOW ALARM')) return 'Low alarm';
   if (upper.includes('INTERVAL')) return 'Interval';
   if (upper.includes('HIGH')) return 'High alarm';
   if (upper.includes('LOW')) return 'Low alarm';
@@ -38,11 +144,188 @@ function eventTypeFromText(eventText) {
   return 'Event';
 }
 
+const groupedDatalogMetrics = ['pressure', 'temperature', 'humidity', 'particles', 'ach', 'velocity'];
+
+function rowMetricKey(reading) {
+  const metric = reading.metric || 'unknown';
+  return Number(reading.sensor_no) === 2 ? `${metric}2` : metric;
+}
+
+function metricColumnLabel(metricKey) {
+  const isSecondSensor = metricKey.endsWith('2');
+  const baseMetric = isSecondSensor ? metricKey.slice(0, -1) : metricKey;
+  return `${metricLabel(baseMetric)}${isSecondSensor ? '2' : ''}`;
+}
+
+function formatReadingCell(reading) {
+  if (!reading) return '—';
+  const value = reading.value ?? '—';
+  const limitText = reading.lower_limit !== null && reading.upper_limit !== null
+    ? ` (${reading.lower_limit} / ${reading.upper_limit})`
+    : '';
+  return `${value}${limitText}`;
+}
+
+function groupReadingsByRoom(readings) {
+  const groups = new Map();
+  for (const reading of readings) {
+    const timeKey = reading.device_ts || reading.received_at || '';
+    const receivedKey = reading.received_at || '';
+    const room = Math.min(2, Math.max(1, Number(reading.room_no || 1)));
+    const key = `${timeKey}|${receivedKey}|${room}|${reading.job_no || ''}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        key,
+        device_ts: reading.device_ts,
+        received_at: reading.received_at,
+        job_no: reading.job_no,
+        room,
+        values: {},
+        eventTypes: new Set(),
+        alarmStates: new Set(),
+        rawEvents: [],
+      });
+    }
+    const group = groups.get(key);
+    group.values[rowMetricKey(reading)] = reading;
+    group.eventTypes.add(eventTypeFromText(reading.event_text));
+    group.alarmStates.add(reading.alarm_state || 'ok');
+    if (reading.event_text) group.rawEvents.push(reading.event_text);
+  }
+  return [...groups.values()].sort((a, b) => new Date(b.device_ts || b.received_at) - new Date(a.device_ts || a.received_at));
+}
+
+function groupAlarmStatus(group) {
+  if (group.alarmStates.has('high')) return 'high';
+  if (group.alarmStates.has('low')) return 'low';
+  return 'ok';
+}
+
+const themeOptions = [
+  { value: 'system', label: 'System', hint: 'Use this device preference' },
+  { value: 'light', label: 'Light', hint: 'Blue and white daytime view' },
+  { value: 'dark', label: 'Dark', hint: 'Black and blue low-light view' },
+];
+
+function resolveTheme(mode) {
+  if (mode === 'dark' || mode === 'light') return mode;
+  if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches) return 'dark';
+  return 'light';
+}
+
+function ThemeSelector({ themeMode, setThemeMode }) {
+  return (
+    <div className="theme-selector" role="group" aria-label="Appearance theme">
+      {themeOptions.map((option) => (
+        <button
+          key={option.value}
+          type="button"
+          className={themeMode === option.value ? 'theme-card active' : 'theme-card'}
+          onClick={() => setThemeMode(option.value)}
+        >
+          <strong>{option.label}</strong>
+          <small>{option.hint}</small>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function StatusPill({ status }) {
   return <span className={`status-pill ${status || 'unknown'}`}>{String(status || 'unknown').replace('_', ' ')}</span>;
 }
 
-function AppShell({ session, title, children }) {
+function BrandWordmark({ className = 'brand-wordmark', variant = 'default' }) {
+  const src = variant === 'tagline' ? '/abatement-tech-tagline.png' : '/abatement-tech-wordmark.png';
+  return <img className={className} src={src} alt="Abatement Technologies" />;
+}
+
+function AlarmBell({ data }) {
+  const [open, setOpen] = useState(false);
+  const activeAlarms = (data?.alarms || []).filter((alarm) => !alarm.resolved_at);
+  const recentLogs = (data?.logs || []).slice(0, 8);
+  const count = activeAlarms.length;
+
+  return (
+    <div className="top-menu-wrap">
+      <button className={`icon-button bell-button ${count ? 'has-alerts' : ''}`} type="button" onClick={() => setOpen((value) => !value)} aria-label="Alarm notifications">
+        <span>🔔</span>
+        {count > 0 && <em>{count}</em>}
+      </button>
+      {open && (
+        <div className="top-popover alarm-popover">
+          <div className="popover-head">
+            <strong>Alarm notifications</strong>
+            <small>{count ? `${count} active alarm${count === 1 ? '' : 's'}` : 'No active alarms'}</small>
+          </div>
+          {activeAlarms.length ? (
+            <div className="popover-list">
+              {activeAlarms.slice(0, 6).map((alarm) => (
+                <NavLink className="popover-row" to={`/devices/${alarm.device_id}`} key={alarm.id} onClick={() => setOpen(false)}>
+                  <StatusPill status={alarm.alarm_state} />
+                  <div>
+                    <strong>{metricLabel(alarm.metric)} {alarm.value ?? '—'}</strong>
+                    <small>R{alarm.room_no}S{alarm.sensor_no} · {new Date(alarm.started_at).toLocaleString()}</small>
+                  </div>
+                </NavLink>
+              ))}
+            </div>
+          ) : (
+            <p className="muted popover-empty">You are clear right now. New device alarms will appear here.</p>
+          )}
+          <div className="popover-head soft-head">
+            <strong>Recent notification queue</strong>
+          </div>
+          <div className="popover-list compact">
+            {recentLogs.length ? recentLogs.map((log) => (
+              <div className="popover-row" key={log.id}>
+                <span className="mini-channel">{log.channel}</span>
+                <div>
+                  <strong>{String(log.alarm_state || '').toUpperCase()}</strong>
+                  <small>{new Date(log.created_at).toLocaleString()} · {log.status}</small>
+                </div>
+              </div>
+            )) : <p className="muted popover-empty">No queued notifications yet.</p>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SupportMenu() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="top-menu-wrap">
+      <button className="support-button" type="button" onClick={() => setOpen((value) => !value)}>Support</button>
+      {open && (
+        <div className="top-popover support-popover">
+          <div className="popover-head">
+            <strong>Support links</strong>
+            <small>Quick access for customer/help desk workflows</small>
+          </div>
+          <a className="support-link-card" href={SUPPORT_PORTAL_URL} target="_blank" rel="noreferrer">
+            <strong>Open ticketing system</strong>
+            <small>Abatement Partner Support / Freshdesk</small>
+          </a>
+          {MONSUITE_URL ? (
+            <a className="support-link-card" href={MONSUITE_URL} target="_blank" rel="noreferrer">
+              <strong>Open MonSuite</strong>
+              <small>Manuals, firmware, product support, and assistant</small>
+            </a>
+          ) : (
+            <div className="support-link-card disabled-card">
+              <strong>MonSuite link not set</strong>
+              <small>Add VITE_MONSUITE_URL in Netlify once you want this button live.</small>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AppShell({ session, title, children, data }) {
   async function logout() {
     await supabase.auth.signOut();
   }
@@ -51,13 +334,20 @@ function AppShell({ session, title, children }) {
     <div className="app-shell">
       <header className="topbar">
         <div className="brand-row">
-          <img src="/abatement-link-mark.svg" alt="Abatement Link" />
-          <div>
-            <strong>{title || 'Abatement Link'}</strong>
-            <small>{session?.user?.email}</small>
+          <img className="brand-mark" src="/abatement-tech-icon.png" alt="Abatement Technologies mark" />
+          <div className="brand-stack">
+            <BrandWordmark />
+            <div className="brand-meta-row">
+              <span className="brand-app-pill">{title || 'Abatement Link'}</span>
+              <small>{session?.user?.email}</small>
+            </div>
           </div>
         </div>
-        <button className="ghost-button" onClick={logout}>Sign out</button>
+        <div className="topbar-actions">
+          <AlarmBell data={data} />
+          <SupportMenu />
+          <button className="ghost-button" onClick={logout}>Sign out</button>
+        </div>
       </header>
       <main className="content">{children}</main>
       <nav className="bottom-nav" aria-label="Main navigation">
@@ -75,7 +365,7 @@ function ConfigMissing() {
   return (
     <main className="login-screen">
       <section className="login-card">
-        <img className="login-logo" src="/abatement-link-mark.svg" alt="Abatement Link" />
+        <BrandWordmark className="login-logo" variant="tagline" />
         <p className="eyebrow">Database setup required</p>
         <h1>Connect Supabase to use live data.</h1>
         <p className="muted">This version is the database-backed Abatement Link build. Add your Supabase URL and anon key in Netlify environment variables, then run the included SQL schema in Supabase.</p>
@@ -122,10 +412,11 @@ function AuthPage({ session }) {
   return (
     <main className="login-screen">
       <section className="login-card">
-        <img className="login-logo" src="/abatement-link-mark.svg" alt="Abatement Link" />
+        <BrandWordmark className="login-logo" variant="tagline" />
         <p className="eyebrow">{mode === 'signup' ? 'Create account' : 'Welcome back'}</p>
         <h1>{mode === 'signup' ? 'Sign up with email.' : 'Sign in to live devices.'}</h1>
         <p className="muted">Email and password only. No SSO, no Google login.</p>
+        <div className="brand-underline"><img src="/abatement-tech-wordmark.png" alt="Abatement Technologies" /></div>
         <form className="form-stack" onSubmit={submit}>
           {mode === 'signup' && <label>Name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Adam" /></label>}
           <label>Email<input type="email" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="user@example.com" required /></label>
@@ -146,11 +437,11 @@ function Protected({ session, children }) {
 }
 
 function useCloudData(session) {
-  const [state, setState] = useState({ devices: [], readings: [], alarms: [], companies: [], members: [], companyDevices: [], notifications: [], logs: [], loading: true });
+  const [state, setState] = useState({ devices: [], readings: [], alarms: [], companies: [], members: [], companyDevices: [], notifications: [], logs: [], pushSubscriptions: [], loading: true });
 
   const refresh = useCallback(async () => {
     if (!session) return;
-    const [devices, readings, alarms, companies, members, companyDevices, notifications, logs] = await Promise.all([
+    const [devices, readings, alarms, companies, members, companyDevices, notifications, logs, pushSubscriptions] = await Promise.all([
       supabase.from('devices').select('*').order('created_at', { ascending: false }),
       supabase.from('device_readings').select('*').order('device_ts', { ascending: false }).limit(400),
       supabase.from('alarm_events').select('*').order('started_at', { ascending: false }).limit(200),
@@ -159,6 +450,7 @@ function useCloudData(session) {
       supabase.from('company_devices').select('*'),
       supabase.from('notification_rules').select('*'),
       supabase.from('notification_logs').select('*').order('created_at', { ascending: false }).limit(100),
+      supabase.from('push_subscriptions').select('*').eq('user_id', session.user.id).order('updated_at', { ascending: false }),
     ]);
     setState({
       devices: devices.data || [],
@@ -169,8 +461,9 @@ function useCloudData(session) {
       companyDevices: companyDevices.data || [],
       notifications: notifications.data || [],
       logs: logs.data || [],
+      pushSubscriptions: pushSubscriptions.data || [],
       loading: false,
-      errors: [devices.error, readings.error, alarms.error, companies.error].filter(Boolean),
+      errors: [devices.error, readings.error, alarms.error, companies.error, pushSubscriptions.error].filter(Boolean),
     });
   }, [session]);
 
@@ -185,6 +478,7 @@ function useCloudData(session) {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'alarm_events' }, refresh)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'company_devices' }, refresh)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'notification_logs' }, refresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'push_subscriptions' }, refresh)
       .subscribe();
     return () => supabase.removeChannel(channel);
   }, [session, refresh]);
@@ -196,14 +490,20 @@ function DashboardPage({ session, data }) {
   const activeAlarms = data.alarms.filter((a) => !a.resolved_at);
   const connected = data.devices.filter((d) => connectionStatus(d) === 'connected');
   return (
-    <AppShell session={session} title="Live Dashboard">
-      <section className="hero-card">
+    <AppShell session={session} title="Live Dashboard" data={data}>
+      <section className="hero-card brand-hero-card">
         <div>
           <p className="eyebrow">Abatement Link Cloud</p>
-          <h1>Live device data, alarms, and customers.</h1>
-          <p className="muted">Database-backed v2: devices update from Supabase when JSON lands in the ingest endpoint.</p>
+          <h1>Live device data, alarms, and customer visibility.</h1>
+          <p className="muted">Real-time monitoring for Abatement devices, with a cleaner branded experience built around your live device data.</p>
+          <div className="hero-actions-row">
+            <NavLink className="primary-button" to="/devices">Add device</NavLink>
+          </div>
         </div>
-        <NavLink className="primary-button" to="/devices">Add device</NavLink>
+        <div className="hero-brand-panel">
+          <img className="hero-mark" src="/abatement-tech-icon.png" alt="Abatement Technologies mark" />
+          <BrandWordmark className="hero-tagline" variant="tagline" />
+        </div>
       </section>
       {data.errors?.length > 0 && <div className="alert danger">Database query issue: {data.errors.map((e) => e.message).join(' | ')}</div>}
       <section className="summary-grid">
@@ -240,6 +540,9 @@ function DevicesPage({ session, data }) {
   const [form, setForm] = useState({ serial: '', nickname: '', model: 'PPM4' });
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [deviceSearch, setDeviceSearch] = useState('');
+  const [activeFilter, setActiveFilter] = useState(null);
+  const [suggestionsOpen, setSuggestionsOpen] = useState(false);
 
   async function addDevice(e) {
     e.preventDefault();
@@ -260,8 +563,87 @@ function DevicesPage({ session, data }) {
     data.refresh();
   }
 
+  const deviceCompanyMap = useMemo(() => {
+    const map = new Map();
+    for (const link of data.companyDevices || []) {
+      const company = data.companies.find((c) => c.id === link.company_id);
+      if (!company) continue;
+      if (!map.has(link.device_id)) map.set(link.device_id, []);
+      map.get(link.device_id).push(company);
+    }
+    return map;
+  }, [data.companyDevices, data.companies]);
+
+  const deviceSuggestions = useMemo(() => {
+    const q = deviceSearch.trim().toLowerCase();
+    if (!q) return [];
+    const suggestions = [];
+    const add = (type, label, value, detail, count = 0) => {
+      const key = `${type}:${value}`;
+      if (!suggestions.some((item) => item.key === key)) suggestions.push({ key, type, label, value, detail, count });
+    };
+
+    for (const company of data.companies || []) {
+      const companyDevices = (data.companyDevices || []).filter((link) => link.company_id === company.id);
+      if (company.name?.toLowerCase().includes(q)) add('company', company.name, company.id, 'Company', companyDevices.length);
+    }
+
+    for (const model of [...new Set((data.devices || []).map((device) => device.model || 'Other'))]) {
+      if (String(model).toLowerCase().includes(q)) add('model', model, model, 'Device type', data.devices.filter((device) => (device.model || 'Other') === model).length);
+    }
+
+    for (const device of data.devices || []) {
+      const name = device.nickname || device.serial_number;
+      if (name?.toLowerCase().includes(q)) add('name', name, device.id, 'Device name', 1);
+      if (device.serial_number?.toLowerCase().includes(q)) add('serial', device.serial_number, device.id, 'Serial number', 1);
+    }
+
+    return suggestions.slice(0, 10);
+  }, [deviceSearch, data.devices, data.companies, data.companyDevices]);
+
+  const filteredDevices = useMemo(() => {
+    const q = deviceSearch.trim().toLowerCase();
+    let devices = [...(data.devices || [])];
+
+    if (activeFilter) {
+      if (activeFilter.type === 'company') devices = devices.filter((device) => (deviceCompanyMap.get(device.id) || []).some((company) => company.id === activeFilter.value));
+      if (activeFilter.type === 'model') devices = devices.filter((device) => (device.model || 'Other') === activeFilter.value);
+      if (activeFilter.type === 'name' || activeFilter.type === 'serial') devices = devices.filter((device) => device.id === activeFilter.value);
+    } else if (q) {
+      devices = devices.filter((device) => {
+        const companies = (deviceCompanyMap.get(device.id) || []).map((company) => company.name).join(' ');
+        return [device.nickname, device.serial_number, device.model, companies].filter(Boolean).join(' ').toLowerCase().includes(q);
+      });
+    }
+
+    const sortKey = activeFilter?.type || 'name';
+    devices.sort((a, b) => {
+      if (sortKey === 'company') {
+        const ac = (deviceCompanyMap.get(a.id) || [])[0]?.name || '';
+        const bc = (deviceCompanyMap.get(b.id) || [])[0]?.name || '';
+        return ac.localeCompare(bc) || (a.nickname || '').localeCompare(b.nickname || '') || a.serial_number.localeCompare(b.serial_number);
+      }
+      if (sortKey === 'model') return String(a.model || '').localeCompare(String(b.model || '')) || (a.nickname || '').localeCompare(b.nickname || '');
+      if (sortKey === 'serial') return String(a.serial_number || '').localeCompare(String(b.serial_number || ''), undefined, { numeric: true });
+      return String(a.nickname || a.serial_number || '').localeCompare(String(b.nickname || b.serial_number || ''));
+    });
+    return devices;
+  }, [data.devices, deviceSearch, activeFilter, deviceCompanyMap]);
+
+  function chooseSuggestion(suggestion) {
+    setActiveFilter(suggestion);
+    setDeviceSearch(suggestion.label);
+    setSuggestionsOpen(false);
+  }
+
+  function clearDeviceFilter() {
+    setActiveFilter(null);
+    setDeviceSearch('');
+    setSuggestionsOpen(false);
+  }
+
   return (
-    <AppShell session={session} title="Devices">
+    <AppShell session={session} title="Devices" data={data}>
       <section className="panel">
         <div className="section-head"><div><p className="eyebrow">Claim monitor</p><h1>Add a device</h1></div></div>
         <form className="form-grid" onSubmit={addDevice}>
@@ -273,9 +655,35 @@ function DevicesPage({ session, data }) {
         {message && <div className="alert info">{message}</div>}
         {error && <div className="alert danger">{error}</div>}
       </section>
-      <section className="section-head"><h2>Your devices</h2><span>{data.devices.length} total</span></section>
+
+      <section className="section-head device-list-head">
+        <div><h2>Your devices</h2><span>{filteredDevices.length} shown · {data.devices.length} total</span></div>
+        <div className="device-search-wrap">
+          <label className="device-search-label">
+            <span>Search / filter</span>
+            <input
+              value={deviceSearch}
+              onChange={(e) => { setDeviceSearch(e.target.value); setActiveFilter(null); setSuggestionsOpen(true); }}
+              onFocus={() => setSuggestionsOpen(true)}
+              placeholder="Name, company, type, serial…"
+            />
+          </label>
+          {activeFilter && <button className="filter-chip" type="button" onClick={clearDeviceFilter}>{activeFilter.detail}: {activeFilter.label} ×</button>}
+          {suggestionsOpen && deviceSearch.trim() && (
+            <div className="device-search-ddl">
+              {deviceSuggestions.length ? deviceSuggestions.map((suggestion) => (
+                <button type="button" key={suggestion.key} onMouseDown={(e) => { e.preventDefault(); chooseSuggestion(suggestion); }}>
+                  <strong>{suggestion.label}</strong>
+                  <small>{suggestion.detail}{suggestion.count ? ` · ${suggestion.count} device${suggestion.count === 1 ? '' : 's'}` : ''}</small>
+                </button>
+              )) : <div className="ddl-empty">No exact filter options. Showing text matches.</div>}
+            </div>
+          )}
+        </div>
+      </section>
+
       <section className="device-grid">
-        {data.devices.length ? data.devices.map((device) => <DeviceCard key={device.id} device={device} readings={data.readings} alarms={data.alarms} />) : <div className="empty-state"><h3>No devices yet</h3><p>Add a serial number above.</p></div>}
+        {filteredDevices.length ? filteredDevices.map((device) => <DeviceCard key={device.id} device={device} readings={data.readings} alarms={data.alarms} />) : <div className="empty-state"><h3>No devices match</h3><p>Try another name, company, device type, or serial number.</p><button className="secondary-button" type="button" onClick={clearDeviceFilter}>Clear search</button></div>}
       </section>
     </AppShell>
   );
@@ -286,8 +694,9 @@ function DevicePage({ session, data }) {
   const navigate = useNavigate();
   const device = data.devices.find((d) => d.id === deviceId);
   const [error, setError] = useState('');
-  if (!device) return <AppShell session={session}><div className="empty-state">Device not found or not shared with you.</div></AppShell>;
+  if (!device) return <AppShell session={session} data={data}><div className="empty-state">Device not found or not shared with you.</div></AppShell>;
   const readings = data.readings.filter((r) => r.device_id === device.id).sort((a, b) => new Date(b.device_ts) - new Date(a.device_ts));
+  const groupedReadings = groupReadingsByRoom(readings);
   const alarms = data.alarms.filter((a) => a.device_id === device.id).sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
   const latest = device.latest_metrics || {};
   const activeAlarm = alarms.find((a) => !a.resolved_at);
@@ -307,18 +716,18 @@ function DevicePage({ session, data }) {
   }
 
   return (
-    <AppShell session={session} title={device.nickname || device.serial_number}>
+    <AppShell session={session} title={device.nickname || device.serial_number} data={data}>
       <section className="device-hero">
         <div><p className="eyebrow">{device.model} · Serial {device.serial_number}</p><h1>{device.nickname || device.serial_number}</h1><div className="inline-actions"><StatusPill status={status} /><span>Validation code: {device.validation_code}</span></div></div>
         <NavLink className="secondary-button" to={`/devices/${device.id}/notifications`}>Notifications</NavLink>
       </section>
       {error && <div className="alert danger">{error}</div>}
-      {!device.verified_at && <section className="panel warning-panel"><h2>Device is Not Verified</h2><p>Tell the customer to enter validation code <strong>{device.validation_code}</strong> on the physical device. The Netlify ingest endpoint will mark it verified when it receives a matching validation_code field. For testing, use the button below.</p><button className="primary-button" onClick={markValidated}>Mark validated for testing</button></section>}
+      {!device.verified_at && <section className="panel warning-panel"><h2>Device is Not Verified</h2><p>Tell the customer to enter validation code <strong>{device.validation_code}</strong> on the physical device. The Netlify ingest endpoint will mark it verified when it receives a matching validation_code field. For internal testing, use the Verify Device button on the Ingest page.</p></section>}
       <section className="metric-grid large">
         {metrics.map((metric) => <div className="metric-tile" key={metric}><span>{metricIcon(metric)}</span><strong>{latest[metric]?.value ?? '—'}</strong><small>{metricLabel(metric)}</small>{latest[metric]?.timestamp && <em>{new Date(latest[metric].timestamp).toLocaleString()}</em>}</div>)}
       </section>
-      <section className="two-col">
-        <div className="panel"><div className="section-head"><h2>Datalog</h2><span>{readings.length}</span></div><div className="table-scroll"><table><thead><tr><th>Time</th><th>Metric</th><th>Value</th><th>Limits</th><th>Event</th></tr></thead><tbody>{readings.slice(0, 100).map((r) => <tr key={r.id}><td>{new Date(r.device_ts).toLocaleString()}</td><td>{metricLabel(r.metric)} R{r.room_no}S{r.sensor_no}</td><td>{r.value ?? '—'}</td><td>{r.lower_limit ?? '—'} / {r.upper_limit ?? '—'}</td><td><span className="event-type-chip">{eventTypeFromText(r.event_text)}</span> <StatusPill status={r.alarm_state} /><small className="event-raw muted">{r.event_text}</small></td></tr>)}</tbody></table></div></div>
+      <section className="device-data-layout">
+        <div className="panel datalog-panel"><div className="section-head"><h2>Datalog</h2><span>{groupedReadings.length} room rows · {readings.length} values</span></div><div className="table-scroll datalog-scroll"><table className="datalog-room-table"><thead><tr><th>Time</th><th>Job</th><th>Room</th>{[...groupedDatalogMetrics.map((metric) => metric), ...groupedDatalogMetrics.map((metric) => `${metric}2`)].map((metricKey) => <th key={metricKey}>{metricColumnLabel(metricKey)}</th>)}<th>Event</th></tr></thead><tbody>{groupedReadings.slice(0, 100).map((row) => <tr key={row.key}><td>{new Date(row.device_ts || row.received_at).toLocaleString()}</td><td>{row.job_no || '—'}</td><td><strong>Room {row.room}</strong></td>{[...groupedDatalogMetrics.map((metric) => metric), ...groupedDatalogMetrics.map((metric) => `${metric}2`)].map((metricKey) => <td key={metricKey}>{formatReadingCell(row.values[metricKey])}</td>)}<td><span className="event-type-chip">{[...row.eventTypes].join(', ')}</span> <StatusPill status={groupAlarmStatus(row)} /><small className="event-raw muted">{row.rawEvents.slice(0, 3).join(' · ')}{row.rawEvents.length > 3 ? ' · …' : ''}</small></td></tr>)}</tbody></table></div></div>
         <div className="panel"><div className="section-head"><h2>Alarm history</h2><span>{alarms.length}</span></div><div className="alarm-list">{alarms.length ? alarms.map((a) => <div className="alarm-item" key={a.id}><StatusPill status={a.alarm_state} /><strong>{metricLabel(a.metric)} {a.value}</strong><small>{new Date(a.started_at).toLocaleString()} {a.resolved_at ? `→ resolved ${new Date(a.resolved_at).toLocaleString()}` : 'active'}</small></div>) : <p className="muted">No alarms yet.</p>}</div></div>
       </section>
       <section className="panel danger-panel soft"><h2>Delete device</h2><p>Deleting removes device registration, datalog, alarm history, notification settings, and company links.</p><button className="danger-button" onClick={deleteDevice}>Delete device and data</button></section>
@@ -333,20 +742,107 @@ function NotificationsPage({ session, data }) {
   const [rule, setRule] = useState(existing || { push_high: true, push_low: true, push_ok: true, email_high: false, email_low: false, email_ok: false, sms_high: false, sms_low: false, sms_ok: false, extra_emails: [] });
   const [newEmail, setNewEmail] = useState('');
   const [message, setMessage] = useState('');
-  if (!device) return <AppShell session={session}><div className="empty-state">Device not found.</div></AppShell>;
+  const [pushBusy, setPushBusy] = useState(false);
+  const [browserPushEndpoint, setBrowserPushEndpoint] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    async function checkCurrentPush() {
+      try {
+        const subscription = await getBrowserPushSubscription();
+        if (!cancelled) setBrowserPushEndpoint(subscription?.endpoint || '');
+      } catch {
+        if (!cancelled) setBrowserPushEndpoint('');
+      }
+    }
+    checkCurrentPush();
+    return () => { cancelled = true; };
+  }, [data.pushSubscriptions?.length]);
+
+  if (!device) return <AppShell session={session} data={data}><div className="empty-state">Device not found.</div></AppShell>;
+
+  const savedBrowserSubscription = data.pushSubscriptions.find((sub) => sub.endpoint === browserPushEndpoint && sub.enabled);
+  const enabledPhoneCount = data.pushSubscriptions.filter((sub) => sub.enabled).length;
+  const phonePushStatus = !phonePushAvailable()
+    ? 'Not supported in this browser'
+    : !VAPID_PUBLIC_KEY
+      ? 'Needs VAPID public key in Netlify'
+      : savedBrowserSubscription
+        ? 'Enabled on this browser/device'
+        : enabledPhoneCount
+          ? `Enabled on ${enabledPhoneCount} saved device${enabledPhoneCount === 1 ? '' : 's'}`
+          : 'Not enabled on this browser yet';
 
   function toggle(key) { setRule((r) => ({ ...r, [key]: !r[key] })); }
   function addEmail() { if (newEmail.trim()) { setRule((r) => ({ ...r, extra_emails: [...(r.extra_emails || []), newEmail.trim()] })); setNewEmail(''); } }
+
   async function save() {
     const payload = { ...rule, device_id: deviceId, user_id: session.user.id, sms_high: false, sms_low: false, sms_ok: false };
     const { error } = await supabase.from('notification_rules').upsert(payload, { onConflict: 'device_id,user_id' });
     setMessage(error ? error.message : 'Notification settings saved. SMS stays disabled until Plivo is added.');
     data.refresh();
   }
-  async function askPush() { if ('Notification' in window) await Notification.requestPermission(); }
+
+  async function enablePhonePush() {
+    setPushBusy(true);
+    setMessage('');
+    try {
+      const subscription = await enablePhonePushForUser(session.user.id);
+      setBrowserPushEndpoint(subscription.endpoint);
+      setMessage('Phone/browser push enabled for this device. Alarm settings below control High, Low, and OK alerts.');
+      data.refresh();
+    } catch (err) {
+      setMessage(err.message || 'Could not enable phone push.');
+    } finally {
+      setPushBusy(false);
+    }
+  }
+
+  async function disablePhonePush() {
+    setPushBusy(true);
+    setMessage('');
+    try {
+      await disablePhonePushForCurrentBrowser(session.user.id);
+      setBrowserPushEndpoint('');
+      setMessage('Phone/browser push disabled for this browser. The in-app alarm bell still follows your push toggles.');
+      data.refresh();
+    } catch (err) {
+      setMessage(err.message || 'Could not disable phone push.');
+    } finally {
+      setPushBusy(false);
+    }
+  }
 
   const channel = (name, keys, disabled = false) => <div className={`panel channel-card ${name.toLowerCase()}`}><h2>{name}{disabled && ' - coming soon'}</h2><div className="toggle-grid">{keys.map(([label, key]) => <button key={key} disabled={disabled} className={`toggle-card ${rule[key] ? 'on' : ''}`} onClick={() => !disabled && toggle(key)}><strong>{label}</strong><small>{rule[key] ? 'On' : 'Off'}</small></button>)}</div></div>;
-  return <AppShell session={session} title="Notifications"><section className="hero-card compact-hero"><div><p className="eyebrow">{device.nickname}</p><h1>Sign up for notifications.</h1><p className="muted">The flow pushes users toward push first, then email. SMS is visible but disabled for the future Plivo integration.</p></div><button className="secondary-button" onClick={askPush}>Enable browser push</button></section>{channel('Push - recommended', [['High alarm', 'push_high'], ['Low alarm', 'push_low'], ['Return to OK', 'push_ok']])}{channel('Email', [['High alarm', 'email_high'], ['Low alarm', 'email_low'], ['Return to OK', 'email_ok']])}<section className="panel"><h2>Extra email recipients</h2><div className="recipient-box"><input value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder="tech@example.com" /><button className="secondary-button" onClick={addEmail}>Add</button><div className="recipient-list">{(rule.extra_emails || []).map((email) => <span key={email}>{email}</span>)}</div></div></section>{channel('SMS', [['High alarm', 'sms_high'], ['Low alarm', 'sms_low'], ['Return to OK', 'sms_ok']], true)}{message && <div className="alert info">{message}</div>}<button className="primary-button sticky-save" onClick={save}>Save notification settings</button></AppShell>;
+
+  return <AppShell session={session} title="Notifications" data={data}>
+    <section className="hero-card compact-hero">
+      <div>
+        <p className="eyebrow">{device.nickname}</p>
+        <h1>Alarm notification settings.</h1>
+        <p className="muted">The alarm bell and phone push channel are on by default for the device owner and accepted company users. Use this page to choose which High, Low, and OK alarms you want.</p>
+      </div>
+      <div className="push-status-card">
+        <strong>Phone push</strong>
+        <small>{phonePushStatus}</small>
+        <div className="quick-buttons push-buttons">
+          <button className="secondary-button slim" type="button" disabled={pushBusy || !phonePushAvailable()} onClick={enablePhonePush}>{pushBusy ? 'Working…' : 'Enable phone alerts'}</button>
+          <button className="ghost-button slim" type="button" disabled={pushBusy || !browserPushEndpoint} onClick={disablePhonePush}>Disable here</button>
+        </div>
+      </div>
+    </section>
+    <section className="panel notification-explainer">
+      <h2>Who gets alarm notifications?</h2>
+      <p>By default, the device owner and every accepted user in a company that contains this device get alarm-bell and phone-push notifications. Each user can turn their own push, email, or future SMS settings on or off here.</p>
+      <p className="muted small-note">Phone push only works on browsers/devices where the user has clicked Enable phone alerts and allowed notifications. On iPhone, users should install the app to the Home Screen for reliable web push.</p>
+    </section>
+    {channel('Alarm bell / Phone push - recommended', [['High alarm', 'push_high'], ['Low alarm', 'push_low'], ['Return to OK', 'push_ok']])}
+    {channel('Email', [['High alarm', 'email_high'], ['Low alarm', 'email_low'], ['Return to OK', 'email_ok']])}
+    <section className="panel"><h2>Extra email recipients</h2><p className="muted">Add additional email addresses that should receive this device’s email notifications when your Email toggles are on.</p><div className="recipient-box"><input value={newEmail} onChange={(e) => setNewEmail(e.target.value)} placeholder="tech@example.com" /><button className="secondary-button" onClick={addEmail}>Add</button><div className="recipient-list">{(rule.extra_emails || []).map((email) => <span key={email}>{email}</span>)}</div></div></section>
+    {channel('SMS', [['High alarm', 'sms_high'], ['Low alarm', 'sms_low'], ['Return to OK', 'sms_ok']], true)}
+    {message && <div className="alert info">{message}</div>}
+    <button className="primary-button sticky-save" onClick={save}>Save notification settings</button>
+  </AppShell>;
 }
 
 function CompaniesPage({ session, data }) {
@@ -446,7 +942,7 @@ function CompaniesPage({ session, data }) {
   }
 
   return (
-    <AppShell session={session} title="Companies">
+    <AppShell session={session} title="Companies" data={data}>
       <section className="panel">
         <p className="eyebrow">Organizations</p>
         <h1>Companies and shared devices.</h1>
@@ -548,15 +1044,91 @@ function IngestPage({ session, data }) {
   const [liveNote, setLiveNote] = useState('');
   const latestJsonRef = useRef(jsonText);
   const liveTickRef = useRef(0);
+  const liveAlarmRef = useRef({ mode: 'ok', age: 0 });
 
   useEffect(() => { latestJsonRef.current = jsonText; }, [jsonText]);
 
   function loadSample(type) {
     const base = { ...samplePayload, TS: deviceTimestamp() };
-    if (type === 'high') base.Event1 = 'PRESSURE R1S1 HIGH -4.200 ALARM';
-    if (type === 'low') base.Event1 = 'PRESSURE R1S1 LOW -28.200 ALARM';
-    if (type === 'ok') base.Event1 = 'PRESSURE R1S1 INTERVAL -13.860 SET MENU PASSWORD';
+    if (type === 'high') base.Event1 = 'PRESSURE R1S1 HIGH ALARM -4.200';
+    if (type === 'low') base.Event1 = 'PRESSURE R1S1 LOW ALARM -28.200';
+    if (type === 'ok') base.Event1 = 'PRESSURE R1S1 OK ALARM -13.860';
+    if (type === 'interval') base.Event1 = 'PRESSURE R1S1 INTERVAL -13.860 SET MENU PASSWORD';
     setJsonText(JSON.stringify(base, null, 2));
+  }
+
+  function pressureScenario(tick) {
+    const state = liveAlarmRef.current;
+    const normalValue = () => randomBetween(-15.2, -12.4, 3).toFixed(3);
+
+    if (state.mode === 'high' || state.mode === 'low') {
+      state.age += 1;
+      if (state.age >= 2) {
+        const room = state.room || 1;
+        const value = normalValue();
+        liveAlarmRef.current = { mode: 'ok', age: 0, room };
+        return {
+          label: `Room ${room} OK alarm`,
+          room,
+          state: 'ok',
+          value,
+          eventText: `PRESSURE R${room}S1 OK ALARM ${value}`,
+        };
+      }
+
+      const room = state.room || 1;
+      if (state.mode === 'high') {
+        const value = randomBetween(-5.9, -3.2, 3).toFixed(3);
+        return {
+          label: `Room ${room} High alarm`,
+          room,
+          state: 'high',
+          value,
+          eventText: `PRESSURE R${room}S1 HIGH ALARM ${value}`,
+        };
+      }
+
+      const value = randomBetween(-30.5, -25.1, 3).toFixed(3);
+      return {
+        label: `Room ${room} Low alarm`,
+        room,
+        state: 'low',
+        value,
+        eventText: `PRESSURE R${room}S1 LOW ALARM ${value}`,
+      };
+    }
+
+    const shouldAlarm = tick > 1 && (tick % 7 === 0 || Math.random() < 0.1);
+    if (shouldAlarm) {
+      const mode = Math.random() < 0.5 ? 'high' : 'low';
+      const room = Math.random() < 0.55 ? 1 : 2;
+      liveAlarmRef.current = { mode, age: 0, room };
+      if (mode === 'high') {
+        const value = randomBetween(-5.9, -3.2, 3).toFixed(3);
+        return {
+          label: `Room ${room} High alarm`,
+          room,
+          state: 'high',
+          value,
+          eventText: `PRESSURE R${room}S1 HIGH ALARM ${value}`,
+        };
+      }
+      const value = randomBetween(-30.5, -25.1, 3).toFixed(3);
+      return {
+        label: `Room ${room} Low alarm`,
+        room,
+        state: 'low',
+        value,
+        eventText: `PRESSURE R${room}S1 LOW ALARM ${value}`,
+      };
+    }
+
+    return {
+      label: 'Interval / OK',
+      room: null,
+      state: 'ok',
+      eventText: null,
+    };
   }
 
   function buildLivePayload() {
@@ -564,39 +1136,67 @@ function IngestPage({ session, data }) {
     try { base = JSON.parse(latestJsonRef.current || '{}'); } catch { base = samplePayload; }
     liveTickRef.current += 1;
     const tick = liveTickRef.current;
-    const pressureBase = -14.2 + Math.sin(tick / 4) * 1.2;
-    const pressure = randomBetween(pressureBase - 0.45, pressureBase + 0.45, 3).toFixed(3);
-    const temp = randomBetween(20.4, 22.6, 1).toFixed(1);
-    const humidity = randomBetween(39, 49, 1).toFixed(1);
-    const particles = Math.round(randomBetween(28, 115, 0));
-    const ach = randomBetween(5.5, 7.4, 1).toFixed(1);
+    const pressure = pressureScenario(tick);
+    const p1Normal = randomBetween(-15.2, -12.4, 3).toFixed(3);
+    const p2Normal = randomBetween(-14.8, -11.9, 3).toFixed(3);
+    const p1Event = pressure.room === 1 ? pressure.eventText : `PRESSURE R1S1 INTERVAL ${p1Normal} SET MENU PASSWORD`;
+    const p2Event = pressure.room === 2 ? pressure.eventText : `PRESSURE R2S1 INTERVAL ${p2Normal} SET MENU PASSWORD`;
+    const temp1 = randomBetween(20.4, 22.6, 1).toFixed(1);
+    const temp2 = randomBetween(20.9, 23.1, 1).toFixed(1);
+    const humidity1 = randomBetween(39, 49, 1).toFixed(1);
+    const humidity2 = randomBetween(40, 51, 1).toFixed(1);
+    const particles1 = Math.round(randomBetween(28, 115, 0));
+    const particles2 = Math.round(randomBetween(32, 130, 0));
+    const ach1 = randomBetween(5.5, 7.4, 1).toFixed(1);
+    const ach2 = randomBetween(4.8, 7.0, 1).toFixed(1);
 
     return {
       unique_id: String(base.unique_id || base.serial || base.serial_number || samplePayload.unique_id),
       ...(base.validation_code ? { validation_code: base.validation_code } : {}),
       JobNo: String(base.JobNo || '41399'),
       TS: deviceTimestamp(),
-      Count: '5',
+      Count: '10',
       RoomNo1: '1',
-      Event1: `PRESSURE R1S1 INTERVAL ${pressure} SET MENU PASSWORD`,
+      Event1: p1Event,
       UpLim1: '-6.494 SET MENU PASSWORD',
       LowLim1: '-23.988 SET MENU PASSWORD',
       RoomNo2: '1',
-      Event2: `TEMPERATURE R1S2 INTERVAL ${temp}`,
+      Event2: `TEMPERATURE R1S1 INTERVAL ${temp1}`,
       UpLim2: '26.0',
       LowLim2: '18.0',
       RoomNo3: '1',
-      Event3: `HUMIDITY R1S3 INTERVAL ${humidity}`,
+      Event3: `HUMIDITY R1S1 INTERVAL ${humidity1}`,
       UpLim3: '60.0',
       LowLim3: '30.0',
       RoomNo4: '1',
-      Event4: `PARTICLE R1S4 INTERVAL ${particles}`,
+      Event4: `PARTICLE R1S1 INTERVAL ${particles1}`,
       UpLim4: '250',
       LowLim4: '0',
       RoomNo5: '1',
-      Event5: `ACH R1S5 INTERVAL ${ach}`,
+      Event5: `ACH R1S2 INTERVAL ${ach1}`,
       UpLim5: '12.0',
       LowLim5: '3.0',
+      RoomNo6: '2',
+      Event6: p2Event,
+      UpLim6: '-6.494 SET MENU PASSWORD',
+      LowLim6: '-23.988 SET MENU PASSWORD',
+      RoomNo7: '2',
+      Event7: `TEMPERATURE R2S1 INTERVAL ${temp2}`,
+      UpLim7: '26.0',
+      LowLim7: '18.0',
+      RoomNo8: '2',
+      Event8: `HUMIDITY R2S1 INTERVAL ${humidity2}`,
+      UpLim8: '60.0',
+      LowLim8: '30.0',
+      RoomNo9: '2',
+      Event9: `PARTICLE R2S2 INTERVAL ${particles2}`,
+      UpLim9: '250',
+      LowLim9: '0',
+      RoomNo10: '2',
+      Event10: `ACH R2S1 INTERVAL ${ach2}`,
+      UpLim10: '12.0',
+      LowLim10: '3.0',
+      _simulated_alarm_note: pressure.label,
     };
   }
 
@@ -612,6 +1212,29 @@ function IngestPage({ session, data }) {
     setResult(body);
     data.refresh();
     return body;
+  }
+
+
+  function currentPayloadSerial() {
+    try {
+      const payload = JSON.parse(jsonText || '{}');
+      return String(payload.unique_id || payload.serial || payload.serial_number || '').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  async function verifyDeviceForTesting() {
+    setError('');
+    setResult(null);
+    const serial = currentPayloadSerial();
+    if (!serial) return setError('Enter a JSON payload with unique_id first.');
+    const device = data.devices.find((item) => item.serial_number === serial);
+    if (!device) return setError(`Serial ${serial} is not in your visible devices. Add it on the Devices page first.`);
+    const { error: updateError } = await supabase.from('devices').update({ verified_at: new Date().toISOString() }).eq('id', device.id);
+    if (updateError) return setError(updateError.message);
+    setResult({ ok: true, serial, deviceStatus: 'verified', readingCount: 0, testVerified: true });
+    data.refresh();
   }
 
   async function ingest(e) {
@@ -637,7 +1260,7 @@ function IngestPage({ session, data }) {
       try {
         const body = await postPayload(payload);
         setLiveCount((count) => count + 1);
-        setLiveNote(`Last live sample sent at ${new Date().toLocaleTimeString()} for serial ${body.serial}.`);
+        setLiveNote(`Last live sample sent at ${new Date().toLocaleTimeString()} for serial ${body.serial}. Scenario: ${payload._simulated_alarm_note || 'Interval / OK'}.`);
       } catch (err) {
         setError(err.message);
         setLiveRunning(false);
@@ -653,7 +1276,7 @@ function IngestPage({ session, data }) {
   }, [liveRunning, secret]);
 
   return (
-    <AppShell session={session} title="Live Ingest">
+    <AppShell session={session} title="Live Ingest" data={data}>
       <section className="hero-card compact-hero">
         <div>
           <p className="eyebrow">Real endpoint tester</p>
@@ -670,7 +1293,7 @@ function IngestPage({ session, data }) {
           </div>
           <StatusPill status={liveRunning ? 'connected' : 'ok'} />
         </div>
-        <p className="muted">Start this while the page is open to send believable pressure, temperature, humidity, particle, and ACH interval readings once every minute. It sends one immediately, then every 60 seconds.</p>
+        <p className="muted">Start this while the page is open to send believable pressure, temperature, humidity, particle, and ACH readings once every minute. Most samples are normal INTERVAL data, but the simulator will occasionally send <strong>HIGH ALARM</strong> or <strong>LOW ALARM</strong>, then send <strong>OK ALARM</strong> after the pressure returns to range.</p>
         <div className="quick-buttons">
           <button className={liveRunning ? 'danger-button' : 'primary-button'} type="button" onClick={() => setLiveRunning((running) => !running)}>
             {liveRunning ? 'Stop live data' : 'Start live data'}
@@ -682,17 +1305,20 @@ function IngestPage({ session, data }) {
 
       <section className="panel">
         <div className="quick-buttons">
-          <button className="secondary-button" type="button" onClick={() => loadSample('ok')}>Interval / OK sample</button>
+          <button className="secondary-button" type="button" onClick={() => loadSample('interval')}>Interval sample</button>
           <button className="secondary-button" type="button" onClick={() => loadSample('high')}>High alarm sample</button>
           <button className="secondary-button" type="button" onClick={() => loadSample('low')}>Low alarm sample</button>
+          <button className="secondary-button" type="button" onClick={() => loadSample('ok')}>OK alarm sample</button>
+          <button className="primary-button" type="button" onClick={verifyDeviceForTesting}>Verify device for testing</button>
         </div>
+        <p className="muted small-note">Verify Device only lives on this Ingest page for internal testing. Later this page can be hidden from normal users.</p>
         <form onSubmit={ingest} className="form-stack">
           <label>Ingest secret<input value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="DEVICE_INGEST_SECRET" /></label>
           <label>Device JSON<textarea value={jsonText} onChange={(e) => setJsonText(e.target.value)} rows="16" /></label>
           <button className="primary-button">Post to live ingest endpoint</button>
         </form>
         {error && <div className="alert danger">{error}</div>}
-        {result && <div className="alert info">Ingested {result.readingCount} reading(s) for serial {result.serial}. Device status: {result.deviceStatus}</div>}
+        {result && <div className="alert info">{result.testVerified ? `Verified test device ${result.serial}.` : `Ingested ${result.readingCount} reading(s) for serial ${result.serial}. Device status: ${result.deviceStatus}`}</div>}
       </section>
 
       <section className="panel">
@@ -703,13 +1329,64 @@ function IngestPage({ session, data }) {
   );
 }
 
-function SettingsPage({ session }) {
-  return <AppShell session={session} title="Settings"><section className="panel"><p className="eyebrow">Cloud setup</p><h1>Abatement Link v2.3</h1><p>This build uses Supabase Auth, Supabase Postgres, Supabase Realtime, and a Netlify Function for device JSON ingest.</p><div className="alert info">SMS is intentionally not functional yet. The database/UI is ready for the future Plivo integration.</div></section><section className="panel"><h2>Required setup</h2><ol className="roadmap"><li>Run <code>database/abatement-link-supabase-schema.sql</code> in Supabase SQL Editor.</li><li>Add Netlify env vars from <code>.env.example</code>.</li><li>Enable email/password auth in Supabase.</li><li>Deploy and test with the Ingest page.</li></ol></section><section className="panel"><h2>Browser reset</h2><p className="muted">Use this if a previous PWA/service-worker version or stuck Supabase session keeps sending this browser to a blank or bad page.</p><button className="secondary-button" type="button" onClick={() => window.clearAbatementLinkBrowserState?.()}>Clear browser data and reload</button></section></AppShell>;
+function SettingsPage({ session, data, themeMode, setThemeMode, resolvedTheme }) {
+  return (
+    <AppShell session={session} title="Settings" data={data}>
+      <section className="panel">
+        <p className="eyebrow">Appearance</p>
+        <h1>Choose your display mode.</h1>
+        <p className="muted">Dark mode uses Abatement black with blue accents. System follows this device automatically.</p>
+        <ThemeSelector themeMode={themeMode} setThemeMode={setThemeMode} />
+        <div className="alert info">Current active theme: <strong>{resolvedTheme === 'dark' ? 'Dark' : 'Light'}</strong>.</div>
+      </section>
+      <section className="panel">
+        <p className="eyebrow">Cloud setup</p>
+        <h1>Abatement Link v2.10</h1>
+        <p>This build uses Supabase Auth, Supabase Postgres, Supabase Realtime, and a Netlify Function for device JSON ingest.</p>
+        <div className="alert info">SMS is intentionally not functional yet. The database/UI is ready for the future Plivo integration. Support uses the Freshdesk link and MonSuite opens at monsuite.netlify.app by default.</div>
+      </section>
+      <section className="panel">
+        <h2>Required setup</h2>
+        <ol className="roadmap">
+          <li>Run <code>database/abatement-link-supabase-schema.sql</code> in Supabase SQL Editor.</li>
+          <li>Add Netlify env vars from <code>.env.example</code>.</li>
+          <li>Enable email/password auth in Supabase.</li>
+          <li>Deploy and test with the Ingest page.</li>
+        </ol>
+      </section>
+      <section className="panel">
+        <h2>Browser reset</h2>
+        <p className="muted">Use this if a previous PWA/service-worker version or stuck Supabase session keeps sending this browser to a blank or bad page.</p>
+        <button className="secondary-button" type="button" onClick={() => window.clearAbatementLinkBrowserState?.()}>Clear browser data and reload</button>
+      </section>
+    </AppShell>
+  );
 }
 
 export default function App() {
   const [session, setSession] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [themeMode, setThemeModeState] = useState(() => localStorage.getItem('abatement-link-theme') || 'system');
+  const [resolvedTheme, setResolvedTheme] = useState(() => resolveTheme(themeMode));
+
+  const setThemeMode = useCallback((mode) => {
+    const next = ['light', 'dark', 'system'].includes(mode) ? mode : 'system';
+    localStorage.setItem('abatement-link-theme', next);
+    setThemeModeState(next);
+  }, []);
+
+  useEffect(() => {
+    const apply = () => {
+      const nextTheme = resolveTheme(themeMode);
+      document.documentElement.dataset.theme = nextTheme;
+      document.documentElement.dataset.themeMode = themeMode;
+      setResolvedTheme(nextTheme);
+    };
+    apply();
+    const media = window.matchMedia?.('(prefers-color-scheme: dark)');
+    media?.addEventListener?.('change', apply);
+    return () => media?.removeEventListener?.('change', apply);
+  }, [themeMode]);
 
   useEffect(() => {
     if (!isSupabaseConfigured) return;
@@ -721,7 +1398,7 @@ export default function App() {
   const data = useCloudData(session);
 
   if (!isSupabaseConfigured) return <ConfigMissing />;
-  if (loading) return <main className="login-screen"><section className="login-card"><img className="login-logo" src="/abatement-link-mark.svg" alt="Abatement Link" /><h1>Loading…</h1></section></main>;
+  if (loading) return <main className="login-screen"><section className="login-card"><BrandWordmark className="login-logo" variant="tagline" /><h1>Loading…</h1></section></main>;
 
-  return <Routes><Route path="/login" element={<AuthPage session={session} />} /><Route path="/" element={<Protected session={session}><DashboardPage session={session} data={data} /></Protected>} /><Route path="/devices" element={<Protected session={session}><DevicesPage session={session} data={data} /></Protected>} /><Route path="/devices/:deviceId" element={<Protected session={session}><DevicePage session={session} data={data} /></Protected>} /><Route path="/devices/:deviceId/notifications" element={<Protected session={session}><NotificationsPage session={session} data={data} /></Protected>} /><Route path="/companies" element={<Protected session={session}><CompaniesPage session={session} data={data} /></Protected>} /><Route path="/ingest" element={<Protected session={session}><IngestPage session={session} data={data} /></Protected>} /><Route path="/settings" element={<Protected session={session}><SettingsPage session={session} /></Protected>} /><Route path="*" element={<Navigate to="/" replace />} /></Routes>;
+  return <Routes><Route path="/login" element={<AuthPage session={session} />} /><Route path="/" element={<Protected session={session}><DashboardPage session={session} data={data} /></Protected>} /><Route path="/devices" element={<Protected session={session}><DevicesPage session={session} data={data} /></Protected>} /><Route path="/devices/:deviceId" element={<Protected session={session}><DevicePage session={session} data={data} /></Protected>} /><Route path="/devices/:deviceId/notifications" element={<Protected session={session}><NotificationsPage session={session} data={data} /></Protected>} /><Route path="/companies" element={<Protected session={session}><CompaniesPage session={session} data={data} /></Protected>} /><Route path="/ingest" element={<Protected session={session}><IngestPage session={session} data={data} /></Protected>} /><Route path="/settings" element={<Protected session={session}><SettingsPage session={session} data={data} themeMode={themeMode} setThemeMode={setThemeMode} resolvedTheme={resolvedTheme} /></Protected>} /><Route path="*" element={<Navigate to="/" replace />} /></Routes>;
 }
