@@ -131,3 +131,50 @@ To generate VAPID keys without local Node/npm after deploying this build once, o
 `https://YOUR-SITE.netlify.app/.netlify/functions/generate-vapid?secret=YOUR_DEVICE_INGEST_SECRET`
 
 Then copy the returned values into Netlify env vars and clear cache/redeploy.
+
+## v2.14 notes
+
+This build uses v2.11 as the baseline and adds:
+
+- Device detail reminders for alarm setup: users are told to set off an alarm with their desired alarm points because Abatement Link cannot know alarm points until the unit sends HIGH ALARM / LOW ALARM / OK ALARM data.
+- Device detail reminder for live interval setup: if there is no current interval data, the page tells users to go to Communications > Cloud Setup > Cloud Intervals on the device.
+- Pending company email access: admins can add an email before that person has an account. The pending email is shown in the company. When that email signs up, the database trigger automatically creates their company membership so they can see shared devices.
+- Clear roles: Admins can add/delete users and devices. Viewers can view shared devices/data only.
+
+Existing databases should run:
+
+```sql
+database/abatement-link-v2-14-device-setup-company-invites-patch.sql
+```
+
+## v2.15 CSV export + QA seed data
+
+Device detail pages now include a **Download CSV** button. The export modal lets the user choose all days or a date range, and optionally thin normal datalog rows by downloading every 2nd, 5th, 10th, 50th, or 100th record. Alarm rows are always included.
+
+For QA/demo data, run this optional SQL file in Supabase SQL Editor:
+
+```txt
+database/abatement-link-v2-15-seed-20-test-devices.sql
+```
+
+At the top of that file, change `seed_user_email` if your test account is not `abatetester1@yopmail.com`.
+
+## v2.16 duplicate serial ownership transfer
+
+This build adds safe handling for a serial number that is already registered:
+
+- Add Device now checks the serial through a protected Netlify function.
+- If the serial already exists, the UI warns: "This device already exists, if you verify it all previous data may be deleted and ownership will be moved to this account."
+- The user can still add the device as **Not Verified**.
+- After the physical device verifies that new claim with the validation code, the device page asks whether to:
+  - keep previous datalog/alarm history and move it to the new account, or
+  - delete previous datalog/alarm history and start fresh.
+- The old registration is removed after the user makes that choice.
+
+Existing databases must run:
+
+```txt
+database/abatement-link-v2-16-serial-takeover-patch.sql
+```
+
+This patch removes the unique serial-number constraint so a pending Not Verified claim can exist while the old registration is still active.
