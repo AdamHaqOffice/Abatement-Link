@@ -1,11 +1,11 @@
 {
-  "name": "abatement-link-v2-19-projects-mvp",
-  "version": "2.19.0",
+  "name": "abatement-link-v2-16-serial-takeover",
+  "version": "2.16.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "node scripts/restore-v2-19.mjs && vite build",
+    "build": "vite build",
     "preview": "vite preview"
   },
   "dependencies": {
