@@ -178,3 +178,44 @@ database/abatement-link-v2-16-serial-takeover-patch.sql
 ```
 
 This patch removes the unique serial-number constraint so a pending Not Verified claim can exist while the old registration is still active.
+
+
+## v2.18 real firmware JSON ingest update
+
+This build updates the parser and ingest simulator for the real PPM/RPM firmware JSON format:
+
+- Interval JSON supports `Count` plus numbered fields: `RoomNo1`, `Event1`, `UpLim1`, `LowLim1`, etc.
+- Alarm JSON supports the single-sensor shape: `RoomNo`, `Event`, `UpLim`, `LowLim`.
+- Event parsing now supports both `R1S1` and firmware spacing like `R1 S1`.
+- Timestamp parsing now supports comma-separated and space-separated device timestamps, including spaces around colons.
+- Numeric parsing preserves spaced negative values like `- 0.0001inWC`.
+- Ingest samples and the live simulator now use firmware-style pressure units and alarm messages.
+
+No Supabase patch is required for v2.18.
+
+## v2.19 Projects MVP
+
+Adds the first Projects framework for Abatement Link, with ICRA / Healthcare Construction as the first project type.
+
+### Deploy notes
+
+Run this Supabase patch before using Projects:
+
+```txt
+database/abatement-link-v2-19-projects-mvp-patch.sql
+```
+
+This patch adds project tables, RLS policies, project type seed data, project asset assignments, project requirements, project events, corrective actions, and draft report records.
+
+### What Projects do in this version
+
+- Adds Projects navigation.
+- Allows creating ICRA / Healthcare Construction projects.
+- Allows assigning existing Abatement Link devices to a project with assignment timestamps.
+- Allows removing a device without deleting historical project association.
+- Allows starting, pausing, and completing a project.
+- Allows recording project requirements with effective timestamps.
+- Allows documenting project events and corrective actions.
+- Shows a project dashboard using existing readings, alarms, and devices.
+
+Projects do not duplicate raw measurement data. Existing device_readings remain the source of truth.

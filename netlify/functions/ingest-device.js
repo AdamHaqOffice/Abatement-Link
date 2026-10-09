@@ -12,19 +12,26 @@ function clampRoomSensor(value) {
   return Math.min(2, Math.max(1, number));
 }
 
+function normalizeNumberText(value) {
+  // Firmware strings can contain a spaced negative sign, e.g. "INTERVAL - 0.0001inWC".
+  // Normalize that before extracting numeric values so the sign is preserved.
+  return String(value ?? '').replace(/-\s+(?=\d)/g, '-');
+}
+
 function firstNumber(value) {
-  const match = String(value ?? '').match(/-?\d+(?:\.\d+)?/);
+  const match = normalizeNumberText(value).match(/-?\d+(?:\.\d+)?/);
   return match ? Number(match[0]) : null;
 }
 
 function lastNumber(value) {
-  const matches = String(value ?? '').match(/-?\d+(?:\.\d+)?/g);
+  const matches = normalizeNumberText(value).match(/-?\d+(?:\.\d+)?/g);
   return matches?.length ? Number(matches[matches.length - 1]) : null;
 }
 
 function parseDeviceTimestamp(ts) {
   if (!ts) return new Date();
-  const match = String(ts).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4}),(\d{1,2}):(\d{2}):(\d{2})/);
+  const text = String(ts).replace(/\s+/g, ' ').trim();
+  const match = text.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})[,\s]+(\d{1,2})\s*:\s*(\d{1,2})\s*:\s*(\d{1,2})/);
   if (!match) return new Date();
   const [, mm, dd, yy, hh, min, ss] = match;
   const year = Number(yy) < 100 ? 2000 + Number(yy) : Number(yy);
@@ -38,7 +45,7 @@ function metricFromEvent(eventText) {
 }
 
 function roomSensor(eventText, fallbackRoom) {
-  const match = String(eventText || '').toUpperCase().match(/R(\d+)S(\d+)/);
+  const match = String(eventText || '').toUpperCase().match(/R\s*(\d+)\s*S\s*(\d+)/);
   return {
     room_no: clampRoomSensor(match ? match[1] : fallbackRoom),
     sensor_no: clampRoomSensor(match ? match[2] : 1),
@@ -211,9 +218,25 @@ export const handler = async (event) => {
   if (!parsed.readings.length) return json(400, { error: 'Payload did not contain any Event fields to store.' });
 
   const db = createClient(supabaseUrl, serviceKey, { auth: { persistSession: false } });
-  const { data: device, error: deviceError } = await db.from('devices').select('*').eq('serial_number', parsed.serial).maybeSingle();
+  const { data: matchingDevices, error: deviceError } = await db.from('devices')
+    .select('*')
+    .eq('serial_number', parsed.serial)
+    .order('created_at', { ascending: false });
   if (deviceError) return json(500, { error: deviceError.message });
-  if (!device) return json(404, { error: `Serial ${parsed.serial} has not been added by a user yet.` });
+  if (!matchingDevices?.length) return json(404, { error: `Serial ${parsed.serial} has not been added by a user yet.` });
+
+  // A serial can have an older verified registration plus a newer Not Verified ownership claim.
+  // If the payload includes a validation code, prioritize the matching claim. Otherwise,
+  // send live data to the finalized/current verified registration until ownership is finalized.
+  let device = null;
+  if (parsed.validationCode) {
+    device = matchingDevices.find((item) => String(item.validation_code || '') === parsed.validationCode) || null;
+  }
+  if (!device) {
+    device = matchingDevices.find((item) => item.verified_at && !item.pending_takeover) ||
+      matchingDevices.find((item) => item.verified_at) ||
+      matchingDevices[0];
+  }
 
   const verifiedAt = device.verified_at || (parsed.validationCode && parsed.validationCode === device.validation_code ? new Date().toISOString() : null);
   const now = new Date().toISOString();

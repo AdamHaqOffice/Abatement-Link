@@ -19,20 +19,27 @@ function clampRoomSensor(value) {
 
 export function parseDeviceTimestamp(ts) {
   if (!ts) return new Date();
-  const match = String(ts).match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4}),(\d{1,2}):(\d{2}):(\d{2})/);
+  const text = String(ts).replace(/\s+/g, ' ').trim();
+  const match = text.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})[,\s]+(\d{1,2})\s*:\s*(\d{1,2})\s*:\s*(\d{1,2})/);
   if (!match) return new Date();
   const [, mm, dd, yy, hh, min, ss] = match;
   const year = Number(yy) < 100 ? 2000 + Number(yy) : Number(yy);
   return new Date(year, Number(mm) - 1, Number(dd), Number(hh), Number(min), Number(ss));
 }
 
+export function normalizeNumberText(value) {
+  // Firmware strings can contain a spaced negative sign, e.g. "INTERVAL - 0.0001inWC".
+  // Normalize that before extracting numeric values so the sign is preserved.
+  return String(value ?? '').replace(/-\s+(?=\d)/g, '-');
+}
+
 export function firstNumber(value) {
-  const match = String(value ?? '').match(/-?\d+(?:\.\d+)?/);
+  const match = normalizeNumberText(value).match(/-?\d+(?:\.\d+)?/);
   return match ? Number(match[0]) : null;
 }
 
 export function lastNumber(value) {
-  const matches = String(value ?? '').match(/-?\d+(?:\.\d+)?/g);
+  const matches = normalizeNumberText(value).match(/-?\d+(?:\.\d+)?/g);
   return matches?.length ? Number(matches[matches.length - 1]) : null;
 }
 
@@ -44,7 +51,7 @@ function getMetric(eventText) {
 
 function getRoomSensor(eventText, fallbackRoom) {
   const upper = String(eventText || '').toUpperCase();
-  const match = upper.match(/R(\d+)S(\d+)/);
+  const match = upper.match(/R\s*(\d+)\s*S\s*(\d+)/);
   return {
     room: clampRoomSensor(match ? match[1] : fallbackRoom),
     sensor: clampRoomSensor(match ? match[2] : 1),

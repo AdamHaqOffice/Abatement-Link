@@ -1,6 +1,6 @@
 {
-  "name": "abatement-link-v2-16-serial-takeover",
-  "version": "2.16.0",
+  "name": "abatement-link-v2-19-projects-mvp",
+  "version": "2.19.0",
   "private": true,
   "type": "module",
   "scripts": {
