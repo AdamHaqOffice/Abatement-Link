@@ -1,6 +1,6 @@
 {
-  "name": "abatement-link-v2-19-projects-mvp",
-  "version": "2.19.0",
+  "name": "abatement-link-v2-25-command-center",
+  "version": "2.25.0",
   "private": true,
   "type": "module",
   "scripts": {

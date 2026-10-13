@@ -219,3 +219,113 @@ This patch adds project tables, RLS policies, project type seed data, project as
 - Shows a project dashboard using existing readings, alarms, and devices.
 
 Projects do not duplicate raw measurement data. Existing device_readings remain the source of truth.
+
+
+## v2.20 real PPM4/RPM firmware payload structure
+
+This build updates the device ingest and UI to match the current PPM4/RPM JSON examples:
+
+- Alarm payloads are single-event objects using `unique_id`, `JobNo`, `RoomNo`, `TS`, `Event`, `UpLim`, and `LowLim`.
+- The alarm state comes from the `Event` string. `HIGH ALARM`, `LOW ALARM`, and `OK ALARM` are handled explicitly.
+- Interval payloads use `Count` with numbered `RoomNo1/Event1/UpLim1/LowLim1` through the sent count.
+- `INTERVAL` readings update live/latest status only and no longer create alarm events just because the value is outside the limits.
+- R/S points are no longer clamped to two sensors. Payloads such as `R10S10` are stored and displayed as their actual point.
+- Device detail now shows a dynamic latest-points grid and a flat datalog matching the payload event structure.
+- The live-data reminder now looks at recent interval/latest metric timestamps and recent device `last_seen_at`, so it does not stay visible after live data is flowing.
+
+Existing databases should also run:
+
+```txt
+database/abatement-link-v2-20-firmware-payloads-patch.sql
+```
+
+That patch fixes a company-invite RLS issue that can show `permission denied for table users` when a normal logged-in user opens the app.
+
+
+## v2.21 live map dashboard
+
+This build adds the first map-command-center MVP:
+
+- New **Map** section in the bottom navigation.
+- Company/project scoped dashboard views.
+- Floorplan creation with optional uploaded image stored as a data URL for the MVP.
+- Blank-layout mode with simple click-to-click wall drawing.
+- Zoom, reset, and pan controls for map-style viewing.
+- Drag connected monitors onto a floorplan.
+- Live markers show the best available live pressure/metric value.
+- Active alarms turn map markers red and pulse.
+- Offline devices show gray.
+- Manual scrubber / HEPA placeholders can be placed now; real HEPA life telemetry can be connected later.
+- Right-side live status and alarm history panels for the selected company/project view.
+
+Existing databases should run:
+
+```txt
+database/abatement-link-v2-21-map-dashboard-patch.sql
+```
+
+For fresh installs, run the base schema and previous patches through v2.20 first, then run the v2.21 patch.
+
+
+## v2.22 floorplan map MVP polish
+
+This version hardens the floorplan system introduced in v2.21:
+
+- Keeps map layouts compatible with uploaded images and blank maps.
+- Ensures layout data can hold walls, zones, labels, and arrows as the drawing tools expand.
+- Adds metadata/index support for placed equipment and floorplan assets.
+
+Existing databases should run:
+
+```txt
+database/abatement-link-v2-22-floorplan-map-mvp-patch.sql
+```
+
+## v2.23 areas / sub-views
+
+This version adds company/project sub-views such as **Left Hospital Wing**, **Right Wing**, **Floor 3**, or **Containment Zone A**.
+
+- Adds **Areas** under a company, project, or personal scope.
+- Lets a user assign devices to an area.
+- Map/dashboard views can now be filtered by area.
+- Floorplans can belong directly to an area.
+
+Existing databases should run:
+
+```txt
+database/abatement-link-v2-23-area-views-patch.sql
+```
+
+## v2.24 equipment and scrubber / HEPA assets
+
+This version adds better map support for non-monitor equipment.
+
+- Add manual scrubbers and other equipment onto floorplans.
+- Store scrubber metadata such as HEPA life %, runtime hours, install date, and notes.
+- Scrubber markers turn attention colors when HEPA life is low.
+- This is ready for future live scrubber telemetry when the devices/software expose it.
+
+Existing databases should run:
+
+```txt
+database/abatement-link-v2-24-equipment-assets-patch.sql
+```
+
+## v2.25 drawing tools
+
+This version adds the next layer of floorplan drawing controls.
+
+- Draw wall lines.
+- Draw zone boxes.
+- Add labels.
+- Add pressure-direction arrows.
+- Clear the drawing layer without deleting devices or equipment.
+- Drawing data is stored in `floorplans.layout_json` as `walls`, `zones`, `labels`, and `arrows`.
+
+Existing databases should run:
+
+```txt
+database/abatement-link-v2-25-drawing-tools-patch.sql
+```
+
+For an upgraded database, run the patches in order from v2.21 through v2.25. For a fresh database, run the base schema, then all patches in order.

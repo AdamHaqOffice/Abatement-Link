@@ -6,10 +6,10 @@ const metricAliases = [
   ['HUMIDITY', 'humidity'], ['PART', 'particles'], ['PARTICLE', 'particles'], ['ACH', 'ach'], ['VELOCITY', 'velocity'], ['AIRFLOW', 'velocity'],
 ];
 
-function clampRoomSensor(value) {
-  const number = Number(value || 1);
-  if (!Number.isFinite(number)) return 1;
-  return Math.min(2, Math.max(1, number));
+function positiveInteger(value, fallback = 1) {
+  const number = Number(value || fallback);
+  if (!Number.isFinite(number) || number < 1) return fallback;
+  return Math.floor(number);
 }
 
 function normalizeNumberText(value) {
@@ -47,30 +47,21 @@ function metricFromEvent(eventText) {
 function roomSensor(eventText, fallbackRoom) {
   const match = String(eventText || '').toUpperCase().match(/R\s*(\d+)\s*S\s*(\d+)/);
   return {
-    room_no: clampRoomSensor(match ? match[1] : fallbackRoom),
-    sensor_no: clampRoomSensor(match ? match[2] : 1),
+    // The current firmware payload can send points like R10S10. Do not clamp to two rooms/sensors.
+    room_no: positiveInteger(match ? match[1] : fallbackRoom, 1),
+    sensor_no: positiveInteger(match ? match[2] : 1, 1),
   };
 }
 
 function alarmState(value, upperLimit, lowerLimit, eventText) {
   const upper = String(eventText || '').toUpperCase();
 
-  // Real device alarm strings. These should override any numeric guesswork.
+  // Real device rule: an ALARM keyword means alarm flow; INTERVAL is live data only.
   if (upper.includes('OK ALARM') || upper.includes('RETURN TO OK')) return 'ok';
   if (upper.includes('HIGH ALARM')) return 'high';
   if (upper.includes('LOW ALARM')) return 'low';
-
-  if (upper.includes('INTERVAL')) {
-    if (value !== null && upperLimit !== null && value > upperLimit) return 'high';
-    if (value !== null && lowerLimit !== null && value < lowerLimit) return 'low';
-    return 'ok';
-  }
-
-  if (upper.includes('HIGH')) return 'high';
-  if (upper.includes('LOW')) return 'low';
-  if (upper.includes('OK') || upper.includes('NORMAL')) return 'ok';
-  if (value !== null && upperLimit !== null && value > upperLimit) return 'high';
-  if (value !== null && lowerLimit !== null && value < lowerLimit) return 'low';
+  if (upper.includes('ALARM')) return 'alarm';
+  if (upper.includes('INTERVAL')) return 'ok';
   return 'ok';
 }
 
@@ -241,16 +232,41 @@ export const handler = async (event) => {
   const verifiedAt = device.verified_at || (parsed.validationCode && parsed.validationCode === device.validation_code ? new Date().toISOString() : null);
   const now = new Date().toISOString();
   const latestMetrics = { ...(device.latest_metrics || {}) };
+  const pointMap = new Map((Array.isArray(latestMetrics._points) ? latestMetrics._points : [])
+    .filter((point) => point?.key)
+    .map((point) => [point.key, point]));
+
   parsed.readings.forEach((reading) => {
-    const metricKey = Number(reading.sensor_no) === 2 ? `${reading.metric}2` : reading.metric;
-    latestMetrics[metricKey] = {
+    const metricKey = `${reading.metric}_r${reading.room_no}s${reading.sensor_no}`;
+    const point = {
+      key: metricKey,
+      metric: reading.metric,
       value: reading.value,
       timestamp: reading.device_ts,
       room: reading.room_no,
       sensor: reading.sensor_no,
+      upperLimit: reading.upper_limit,
+      lowerLimit: reading.lower_limit,
       alarmState: reading.alarm_state,
+      eventText: reading.event_text,
     };
+    latestMetrics[metricKey] = point;
+    pointMap.set(metricKey, point);
+
+    // Keep the old keys for backward-compatible dashboard cards.
+    if (Number(reading.room_no) === 1 && Number(reading.sensor_no) === 1) latestMetrics[reading.metric] = point;
+    if (Number(reading.room_no) === 1 && Number(reading.sensor_no) === 2) latestMetrics[`${reading.metric}2`] = point;
+
+    const upperEvent = String(reading.event_text || '').toUpperCase();
+    if (upperEvent.includes('INTERVAL')) latestMetrics._lastIntervalAt = reading.device_ts;
+    if (upperEvent.includes('ALARM')) latestMetrics._lastAlarmAt = reading.device_ts;
   });
+
+  latestMetrics._points = [...pointMap.values()].sort((a, b) =>
+    Number(a.room || 0) - Number(b.room || 0) ||
+    Number(a.sensor || 0) - Number(b.sensor || 0) ||
+    String(a.metric || '').localeCompare(String(b.metric || ''))
+  );
 
   const { error: updateError } = await db.from('devices').update({
     verified_at: verifiedAt,
@@ -275,10 +291,10 @@ export const handler = async (event) => {
       .is('resolved_at', null)
       .maybeSingle();
 
-    if (reading.alarm_state === 'high' || reading.alarm_state === 'low') {
+    if (reading.alarm_state === 'high' || reading.alarm_state === 'low' || reading.alarm_state === 'alarm') {
       if (!active || active.alarm_state !== reading.alarm_state) {
         if (active) await db.from('alarm_events').update({ resolved_at: reading.device_ts }).eq('id', active.id);
-        const limitValue = reading.alarm_state === 'high' ? reading.upper_limit : reading.lower_limit;
+        const limitValue = reading.alarm_state === 'high' ? reading.upper_limit : reading.alarm_state === 'low' ? reading.lower_limit : null;
         const { data: alarm } = await db.from('alarm_events').insert({
           device_id: device.id,
           reading_id: reading.id,

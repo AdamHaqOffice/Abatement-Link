@@ -3,7 +3,7 @@ import { Navigate, NavLink, Route, Routes, useNavigate, useParams } from 'react-
 import { supabase, isSupabaseConfigured } from './lib/supabaseClient.js';
 import { connectionStatus, metricIcon, metricLabel } from './utils/parseDevicePayload.js';
 
-const metrics = ['pressure', 'pressure2', 'temperature', 'temperature2', 'humidity', 'humidity2', 'particles', 'particles2', 'ach', 'ach2', 'velocity', 'velocity2'];
+const fallbackMetricOrder = ['pressure', 'temperature', 'humidity', 'particles', 'ach', 'velocity'];
 const samplePayload = {
   unique_id: '14374082',
   JobNo: 'JOB-33300',
@@ -115,15 +115,8 @@ function eventTypeFromText(eventText) {
 
 const groupedDatalogMetrics = ['pressure', 'temperature', 'humidity', 'particles', 'ach', 'velocity'];
 
-function rowMetricKey(reading) {
-  const metric = reading.metric || 'unknown';
-  return Number(reading.sensor_no) === 2 ? `${metric}2` : metric;
-}
-
-function metricColumnLabel(metricKey) {
-  const isSecondSensor = metricKey.endsWith('2');
-  const baseMetric = isSecondSensor ? metricKey.slice(0, -1) : metricKey;
-  return `${metricLabel(baseMetric)}${isSecondSensor ? '2' : ''}`;
+function readingPointKey(reading) {
+  return `${reading.metric || 'unknown'}_r${reading.room_no || 1}s${reading.sensor_no || 1}`;
 }
 
 function formatReadingCell(reading) {
@@ -135,38 +128,242 @@ function formatReadingCell(reading) {
   return `${value}${limitText}`;
 }
 
-function groupReadingsByRoom(readings) {
-  const groups = new Map();
-  for (const reading of readings) {
-    const timeKey = reading.device_ts || reading.received_at || '';
-    const receivedKey = reading.received_at || '';
-    const room = Math.min(2, Math.max(1, Number(reading.room_no || 1)));
-    const key = `${timeKey}|${receivedKey}|${room}|${reading.job_no || ''}`;
-    if (!groups.has(key)) {
-      groups.set(key, {
-        key,
-        device_ts: reading.device_ts,
-        received_at: reading.received_at,
-        job_no: reading.job_no,
-        room,
-        values: {},
-        eventTypes: new Set(),
-        alarmStates: new Set(),
-        rawEvents: [],
-      });
-    }
-    const group = groups.get(key);
-    group.values[rowMetricKey(reading)] = reading;
-    group.eventTypes.add(eventTypeFromText(reading.event_text));
-    group.alarmStates.add(reading.alarm_state || 'ok');
-    if (reading.event_text) group.rawEvents.push(reading.event_text);
+function readingAlarmStatus(reading) {
+  return reading?.alarm_state || 'ok';
+}
+
+function readingSortOldest(a, b) {
+  return new Date(a.device_ts || a.received_at || 0) - new Date(b.device_ts || b.received_at || 0);
+}
+
+function latestMetricPoints(device, readings = []) {
+  const latest = device?.latest_metrics || {};
+  const points = Array.isArray(latest._points) ? latest._points : [];
+  const map = new Map();
+
+  for (const point of points) {
+    if (!point?.key) continue;
+    map.set(point.key, point);
   }
-  return [...groups.values()].sort((a, b) => new Date(b.device_ts || b.received_at) - new Date(a.device_ts || a.received_at));
+
+  // Backfill from loaded readings so older data still displays after deploying this build.
+  for (const reading of readings || []) {
+    const key = readingPointKey(reading);
+    if (map.has(key)) continue;
+    map.set(key, {
+      key,
+      metric: reading.metric,
+      value: reading.value,
+      timestamp: reading.device_ts || reading.received_at,
+      room: reading.room_no || 1,
+      sensor: reading.sensor_no || 1,
+      upperLimit: reading.upper_limit,
+      lowerLimit: reading.lower_limit,
+      alarmState: reading.alarm_state,
+      eventText: reading.event_text,
+    });
+  }
+
+  // Legacy latest_metrics support from old builds.
+  for (const metric of fallbackMetricOrder) {
+    const value = latest[metric];
+    if (value && !map.has(`${metric}_r1s1`)) {
+      map.set(`${metric}_r1s1`, { key: `${metric}_r1s1`, metric, room: value.room || 1, sensor: value.sensor || 1, ...value });
+    }
+    const value2 = latest[`${metric}2`];
+    if (value2 && !map.has(`${metric}_r1s2`)) {
+      map.set(`${metric}_r1s2`, { key: `${metric}_r1s2`, metric, room: value2.room || 1, sensor: value2.sensor || 2, ...value2 });
+    }
+  }
+
+  return [...map.values()].sort((a, b) =>
+    Number(a.room || 0) - Number(b.room || 0) ||
+    Number(a.sensor || 0) - Number(b.sensor || 0) ||
+    fallbackMetricOrder.indexOf(a.metric) - fallbackMetricOrder.indexOf(b.metric) ||
+    String(a.metric || '').localeCompare(String(b.metric || ''))
+  );
+}
+
+function latestIntervalTimestamp(device, readings = []) {
+  const latest = device?.latest_metrics || {};
+  const candidates = [];
+  if (latest._lastIntervalAt) candidates.push(latest._lastIntervalAt);
+  for (const reading of readings || []) {
+    if (String(reading.event_text || '').toUpperCase().includes('INTERVAL')) {
+      candidates.push(reading.device_ts || reading.received_at);
+    }
+  }
+  if (!candidates.length) {
+    // If the device has recent latest metric timestamps from an older ingest build, treat it as live data.
+    for (const point of latestMetricPoints(device, readings)) {
+      if (point.timestamp) candidates.push(point.timestamp);
+    }
+  }
+  return candidates
+    .filter(Boolean)
+    .sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] || null;
+}
+
+function hasRecentTimestamp(value, hours = 3) {
+  if (!value) return false;
+  const timestamp = new Date(value).getTime();
+  if (Number.isNaN(timestamp)) return false;
+  return (Date.now() - timestamp) < (hours * 60 * 60 * 1000);
+}
+
+
+
+function metricUnit(metric) {
+  if (metric === 'pressure') return 'inWC';
+  if (metric === 'temperature') return 'F';
+  if (metric === 'humidity') return '%';
+  if (metric === 'particles') return 'µg/m³';
+  if (metric === 'ach' || metric === 'velocity') return 'm/s';
+  return '';
+}
+
+function formatMetricPoint(point) {
+  if (!point) return 'No live reading';
+  const unit = metricUnit(point.metric);
+  return `${point.value ?? '—'}${unit ? ` ${unit}` : ''}`;
+}
+
+function readingsForDevice(data, deviceId) {
+  return (data.readings || []).filter((reading) => reading.device_id === deviceId);
+}
+
+function primaryMapPoint(device, data) {
+  const points = latestMetricPoints(device, readingsForDevice(data, device.id));
+  return points.find((point) => point.metric === 'pressure') || points[0] || null;
+}
+
+function activeDeviceAlarm(device, data) {
+  return (data.alarms || []).find((alarm) => alarm.device_id === device.id && !alarm.resolved_at) || null;
+}
+
+function mapDeviceStatus(device, data) {
+  const alarm = activeDeviceAlarm(device, data);
+  if (alarm) return alarm.alarm_state === 'low' ? 'low' : 'high';
+  const status = connectionStatus(device);
+  if (status === 'connected') return 'ok';
+  if (status === 'not_verified') return 'setup';
+  return 'offline';
+}
+
+function mapDeviceStatusLabel(device, data) {
+  const status = mapDeviceStatus(device, data);
+  if (status === 'high') return 'HIGH ALARM';
+  if (status === 'low') return 'LOW ALARM';
+  if (status === 'setup') return 'Not verified';
+  if (status === 'offline') return 'Offline';
+  return 'OK';
+}
+
+
+function companyDevicesFor(data, companyId) {
+  const ids = new Set((data.companyDevices || []).filter((link) => link.company_id === companyId).map((link) => link.device_id));
+  return (data.devices || []).filter((device) => ids.has(device.id));
+}
+
+function projectDevicesFor(data, projectId) {
+  const ids = new Set((data.projectAssets || []).filter((link) => link.project_id === projectId && !link.removed_at).map((link) => link.device_id));
+  return (data.devices || []).filter((device) => ids.has(device.id));
+}
+
+function areaDevicesFor(data, areaId) {
+  const ids = new Set((data.areaDevices || []).filter((link) => link.area_id === areaId).map((link) => link.device_id));
+  return (data.devices || []).filter((device) => ids.has(device.id));
+}
+
+function areaParentLabel(area, data) {
+  if (area?.company_id) return data.companies?.find((company) => company.id === area.company_id)?.name || 'Company area';
+  if (area?.project_id) return data.projects?.find((project) => project.id === area.project_id)?.name || 'Project area';
+  return 'Personal area';
+}
+
+function deviceScopeOptions(data) {
+  const options = [{ type: 'all', id: 'all', label: 'All my devices', hint: `${data.devices?.length || 0} devices` }];
+  for (const company of data.companies || []) {
+    options.push({ type: 'company', id: company.id, label: company.name, hint: `${companyDevicesFor(data, company.id).length} company devices` });
+  }
+  for (const project of data.projects || []) {
+    options.push({ type: 'project', id: project.id, label: project.name, hint: `${projectDevicesFor(data, project.id).length} project devices` });
+  }
+  for (const area of data.areas || []) {
+    options.push({ type: 'area', id: area.id, label: area.name, hint: `${areaDevicesFor(data, area.id).length} area devices · ${areaParentLabel(area, data)}` });
+  }
+  return options;
+}
+
+function devicesForScope(data, scopeKey) {
+  const [type, id] = String(scopeKey || 'all:all').split(':');
+  if (type === 'company') return companyDevicesFor(data, id);
+  if (type === 'project') return projectDevicesFor(data, id);
+  if (type === 'area') return areaDevicesFor(data, id);
+  return data.devices || [];
+}
+
+function floorplansForScope(data, scopeKey) {
+  const [type, id] = String(scopeKey || 'all:all').split(':');
+  return (data.floorplans || []).filter((plan) => {
+    if (type === 'company') return plan.company_id === id && !plan.area_id;
+    if (type === 'project') return plan.project_id === id && !plan.area_id;
+    if (type === 'area') return plan.area_id === id;
+    return !plan.company_id && !plan.project_id && !plan.area_id;
+  });
+}
+
+function selectedScopePayload(scopeKey) {
+  const [type, id] = String(scopeKey || 'all:all').split(':');
+  if (type === 'company') return { company_id: id, project_id: null, area_id: null };
+  if (type === 'project') return { project_id: id, company_id: null, area_id: null };
+  if (type === 'area') return { area_id: id, company_id: null, project_id: null };
+  return { company_id: null, project_id: null, area_id: null };
+}
+
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function scrubberStatusFromMetadata(metadata = {}) {
+  const life = Number(metadata.hepa_life_percent ?? metadata.hepaLifePercent ?? metadata.hepa_percent ?? 100);
+  if (!Number.isFinite(life)) return 'service';
+  if (life <= 15) return 'high';
+  if (life <= 35) return 'service';
+  return 'ok';
+}
+
+function assetMapStatus(asset, device, data) {
+  if (device) return mapDeviceStatus(device, data);
+  if (asset?.asset_type === 'scrubber') return scrubberStatusFromMetadata(asset.metadata || {});
+  return 'setup';
+}
+
+function assetStatusText(asset, device, data) {
+  if (device) return mapDeviceStatusLabel(device, data);
+  if (asset?.asset_type === 'scrubber') {
+    const metadata = asset.metadata || {};
+    const life = metadata.hepa_life_percent ?? metadata.hepaLifePercent ?? metadata.hepa_percent;
+    return life === undefined || life === '' ? 'Manual HEPA status' : `HEPA ${life}%`;
+  }
+  return 'Manual asset';
+}
+
+function metadataNumber(value, fallback = '') {
+  if (value === '' || value === null || value === undefined) return fallback;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : fallback;
 }
 
 function groupAlarmStatus(group) {
-  if (group.alarmStates.has('high')) return 'high';
-  if (group.alarmStates.has('low')) return 'low';
+  if (group.alarmStates?.has('high')) return 'high';
+  if (group.alarmStates?.has('low')) return 'low';
+  if (group.alarmStates?.has('alarm')) return 'alarm';
   return 'ok';
 }
 
@@ -299,13 +496,12 @@ async function fetchAllDeviceRows(table, deviceId, timeColumn, startIso, endIso)
   return rows;
 }
 
-function isGroupedAlarmRow(row) {
-  const eventText = [...(row.eventTypes || [])].join(' ').toUpperCase();
-  return eventText.includes('ALARM') || groupAlarmStatus(row) !== 'ok';
+function isAlarmReading(reading) {
+  const eventText = String(reading.event_text || '').toUpperCase();
+  return eventText.includes('ALARM') || readingAlarmStatus(reading) !== 'ok';
 }
 
-function buildDeviceCsv(device, groupedRows, alarmRows) {
-  const metricKeys = [...groupedDatalogMetrics.map((metric) => metric), ...groupedDatalogMetrics.map((metric) => `${metric}2`)];
+function buildDeviceCsv(device, readingRows, alarmRows) {
   const columns = [
     'Type',
     'Time',
@@ -314,39 +510,42 @@ function buildDeviceCsv(device, groupedRows, alarmRows) {
     'Device Name',
     'Model',
     'Room',
-    ...metricKeys.map(metricColumnLabel),
-    'Event',
+    'Sensor',
+    'Metric',
+    'Value',
+    'Lower Limit',
+    'Upper Limit',
+    'Event Type',
     'Alarm State',
-    'Alarm Metric',
-    'Alarm Value',
     'Alarm Limit',
     'Resolved At',
     'Raw Event Text',
   ];
 
   const rows = [];
-  for (const row of groupedRows) {
+  for (const reading of readingRows) {
     rows.push([
       'Datalog',
-      row.device_ts || row.received_at || '',
+      reading.device_ts || reading.received_at || '',
       device.serial_number,
-      row.job_no || '',
+      reading.job_no || '',
       device.nickname || '',
       device.model || '',
-      row.room ? `Room ${row.room}` : '',
-      ...metricKeys.map((metricKey) => formatReadingCell(row.values[metricKey])),
-      [...(row.eventTypes || [])].join(' · '),
-      groupAlarmStatus(row),
+      reading.room_no ? `R${reading.room_no}` : '',
+      reading.sensor_no ? `S${reading.sensor_no}` : '',
+      metricLabel(reading.metric),
+      reading.value ?? '',
+      reading.lower_limit ?? '',
+      reading.upper_limit ?? '',
+      eventTypeFromText(reading.event_text),
+      reading.alarm_state || '',
       '',
       '',
-      '',
-      '',
-      (row.rawEvents || []).join(' · '),
+      reading.event_text || '',
     ]);
   }
 
   for (const alarm of alarmRows) {
-    const metricValues = metricKeys.map(() => '');
     rows.push([
       'Alarm',
       alarm.started_at || alarm.created_at || '',
@@ -354,12 +553,14 @@ function buildDeviceCsv(device, groupedRows, alarmRows) {
       '',
       device.nickname || '',
       device.model || '',
-      alarm.room_no ? `Room ${alarm.room_no}` : '',
-      ...metricValues,
-      eventTypeFromText(alarm.event_text),
-      alarm.alarm_state || '',
+      alarm.room_no ? `R${alarm.room_no}` : '',
+      alarm.sensor_no ? `S${alarm.sensor_no}` : '',
       metricLabel(alarm.metric),
       alarm.value ?? '',
+      '',
+      '',
+      eventTypeFromText(alarm.event_text),
+      alarm.alarm_state || '',
       alarm.limit_value ?? '',
       alarm.resolved_at || '',
       alarm.event_text || '',
@@ -369,6 +570,7 @@ function buildDeviceCsv(device, groupedRows, alarmRows) {
   rows.sort((a, b) => new Date(a[1] || 0) - new Date(b[1] || 0) || String(a[0]).localeCompare(String(b[0])));
   return [columns, ...rows].map((row) => row.map(csvEscape).join(',')).join('\n');
 }
+
 
 function triggerCsvDownload(filename, csvText) {
   const blob = new Blob([csvText], { type: 'text/csv;charset=utf-8;' });
@@ -419,8 +621,8 @@ function CsvDownloadModal({ device, onClose }) {
         fetchAllDeviceRows('alarm_events', device.id, 'started_at', startIso, endIso),
       ]);
 
-      const grouped = groupReadingsByRoom(readings).sort((a, b) => new Date(a.device_ts || a.received_at || 0) - new Date(b.device_ts || b.received_at || 0));
-      const selectedRows = grouped.filter((row, index) => isGroupedAlarmRow(row) || every <= 1 || index % every === 0);
+      const orderedReadings = [...readings].sort(readingSortOldest);
+      const selectedRows = orderedReadings.filter((reading, index) => isAlarmReading(reading) || every <= 1 || index % every === 0);
       const csvText = buildDeviceCsv(device, selectedRows, alarms);
       const jobName = device.last_job_no || readings.find((reading) => reading.job_no)?.job_no || 'job';
       const filename = `${safeFilePart(device.serial_number, 'serial')}-${safeFilePart(jobName, 'job')}-${localDateStamp()}.csv`;
@@ -631,6 +833,7 @@ function AppShell({ session, title, children, data }) {
       <nav className="bottom-nav" aria-label="Main navigation">
         <NavLink to="/">Home</NavLink>
         <NavLink to="/devices">Devices</NavLink>
+        <NavLink to="/map">Map</NavLink>
         <NavLink to="/projects">Projects</NavLink>
         <NavLink to="/companies">Companies</NavLink>
         <NavLink to="/ingest">Ingest</NavLink>
@@ -716,7 +919,7 @@ function Protected({ session, children }) {
 }
 
 function useCloudData(session) {
-  const [state, setState] = useState({ devices: [], readings: [], alarms: [], companies: [], members: [], companyInvites: [], companyDevices: [], notifications: [], logs: [], pushSubscriptions: [], projectTypes: [], projects: [], projectRequirements: [], projectAssets: [], projectContacts: [], projectEvents: [], projectCorrectiveActions: [], projectReports: [], loading: true });
+  const [state, setState] = useState({ devices: [], readings: [], alarms: [], companies: [], members: [], companyInvites: [], companyDevices: [], notifications: [], logs: [], pushSubscriptions: [], projectTypes: [], projects: [], projectRequirements: [], projectAssets: [], projectContacts: [], projectEvents: [], projectCorrectiveActions: [], projectReports: [], areas: [], areaDevices: [], floorplans: [], floorplanAssets: [], loading: true });
   const claimedInvitesRef = useRef(false);
 
   const refresh = useCallback(async () => {
@@ -725,7 +928,7 @@ function useCloudData(session) {
       claimedInvitesRef.current = true;
       try { await supabase.rpc('claim_my_company_invites'); } catch { /* Older schemas can ignore this. */ }
     }
-    const [devices, readings, alarms, companies, members, companyInvites, companyDevices, notifications, logs, pushSubscriptions, projectTypes, projects, projectRequirements, projectAssets, projectContacts, projectEvents, projectCorrectiveActions, projectReports] = await Promise.all([
+    const [devices, readings, alarms, companies, members, companyInvites, companyDevices, notifications, logs, pushSubscriptions, projectTypes, projects, projectRequirements, projectAssets, projectContacts, projectEvents, projectCorrectiveActions, projectReports, areas, areaDevices, floorplans, floorplanAssets] = await Promise.all([
       supabase.from('devices').select('*').order('created_at', { ascending: false }),
       supabase.from('device_readings').select('*').order('device_ts', { ascending: false }).limit(400),
       supabase.from('alarm_events').select('*').order('started_at', { ascending: false }).limit(200),
@@ -744,6 +947,10 @@ function useCloudData(session) {
       supabase.from('project_events').select('*').order('event_at', { ascending: false }),
       supabase.from('project_corrective_actions').select('*').order('created_at', { ascending: false }),
       supabase.from('project_reports').select('*').order('created_at', { ascending: false }),
+      supabase.from('areas').select('*').order('created_at', { ascending: false }),
+      supabase.from('area_devices').select('*').order('created_at', { ascending: false }),
+      supabase.from('floorplans').select('*').order('created_at', { ascending: false }),
+      supabase.from('floorplan_assets').select('*').order('created_at', { ascending: false }),
     ]);
     setState({
       devices: devices.data || [],
@@ -764,8 +971,12 @@ function useCloudData(session) {
       projectEvents: projectEvents.data || [],
       projectCorrectiveActions: projectCorrectiveActions.data || [],
       projectReports: projectReports.data || [],
+      areas: areas.data || [],
+      areaDevices: areaDevices.data || [],
+      floorplans: floorplans.data || [],
+      floorplanAssets: floorplanAssets.data || [],
       loading: false,
-      errors: [devices.error, readings.error, alarms.error, companies.error, companyInvites.error, pushSubscriptions.error, projects.error, projectRequirements.error, projectAssets.error, projectEvents.error, projectCorrectiveActions.error].filter(Boolean),
+      errors: [devices.error, readings.error, alarms.error, companies.error, companyInvites.error, pushSubscriptions.error, projects.error, projectRequirements.error, projectAssets.error, projectEvents.error, projectCorrectiveActions.error, areas.error, areaDevices.error, floorplans.error, floorplanAssets.error].filter(Boolean),
     });
   }, [session]);
 
@@ -788,6 +999,10 @@ function useCloudData(session) {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'project_asset_assignments' }, refresh)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'project_events' }, refresh)
       .on('postgres_changes', { event: '*', schema: 'public', table: 'project_corrective_actions' }, refresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'areas' }, refresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'area_devices' }, refresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'floorplans' }, refresh)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'floorplan_assets' }, refresh)
       .subscribe();
     return () => supabase.removeChannel(channel);
   }, [session, refresh]);
@@ -832,21 +1047,20 @@ function DashboardPage({ session, data }) {
 function DeviceCard({ device, readings, alarms }) {
   const activeAlarm = alarms.find((a) => a.device_id === device.id && !a.resolved_at);
   const status = activeAlarm ? activeAlarm.alarm_state : connectionStatus(device);
-  const latest = device.latest_metrics || {};
+  const deviceReadings = readings.filter((r) => r.device_id === device.id);
+  const points = latestMetricPoints(device, deviceReadings).slice(0, 4);
   return (
     <NavLink className="device-card" to={`/devices/${device.id}`}>
-      <div className="device-card-head">
-        <div className="device-title-block"><strong>{device.nickname || device.serial_number}</strong><small>{device.model || 'Monitor'} · {device.serial_number}</small></div>
-        <StatusPill status={status} />
-      </div>
+      <div className="device-card-head"><div><strong>{device.nickname || device.serial_number}</strong><small>{device.model || 'Monitor'} · {device.serial_number}</small></div><StatusPill status={status} /></div>
       <div className="device-meta"><span>Job {device.last_job_no || '—'}</span><span>Last seen {device.last_seen_at ? new Date(device.last_seen_at).toLocaleString() : 'Never'}</span></div>
       <div className="metric-strip">
-        {metrics.slice(0, 4).map((m) => <div className="metric-mini" key={m}><span>{metricIcon(m)}</span><strong>{latest[m]?.value ?? '—'}</strong><small>{metricLabel(m)}</small></div>)}
+        {points.length ? points.map((point) => <div className="metric-mini" key={point.key}><span>{metricIcon(point.metric)}</span><strong>{point.value ?? '—'}</strong><small>{metricLabel(point.metric)} R{point.room}S{point.sensor}</small></div>) : fallbackMetricOrder.slice(0, 4).map((m) => <div className="metric-mini" key={m}><span>{metricIcon(m)}</span><strong>—</strong><small>{metricLabel(m)}</small></div>)}
       </div>
-      <small className="muted device-card-foot">{readings.filter((r) => r.device_id === device.id).length} readings · {alarms.filter((a) => a.device_id === device.id).length} alarms</small>
+      <small className="muted">{deviceReadings.length} readings · {alarms.filter((a) => a.device_id === device.id).length} alarms</small>
     </NavLink>
   );
 }
+
 
 function DevicesPage({ session, data }) {
   const [form, setForm] = useState({ serial: '', nickname: '', model: 'PPM4' });
@@ -1026,14 +1240,12 @@ function DevicePage({ session, data }) {
   const [csvOpen, setCsvOpen] = useState(false);
   if (!device) return <AppShell session={session} data={data}><div className="empty-state">Device not found or not shared with you.</div></AppShell>;
   const readings = data.readings.filter((r) => r.device_id === device.id).sort((a, b) => new Date(b.device_ts) - new Date(a.device_ts));
-  const groupedReadings = groupReadingsByRoom(readings);
   const alarms = data.alarms.filter((a) => a.device_id === device.id).sort((a, b) => new Date(b.started_at) - new Date(a.started_at));
-  const latest = device.latest_metrics || {};
+  const latestPoints = latestMetricPoints(device, readings);
   const activeAlarm = alarms.find((a) => !a.resolved_at);
   const status = activeAlarm ? activeAlarm.alarm_state : connectionStatus(device);
-  const intervalReadings = readings.filter((reading) => String(reading.event_text || '').toUpperCase().includes('INTERVAL'));
-  const latestIntervalTime = intervalReadings[0]?.device_ts || intervalReadings[0]?.received_at;
-  const hasCurrentIntervalData = latestIntervalTime ? (Date.now() - new Date(latestIntervalTime).getTime()) < (3 * 60 * 60 * 1000) : false;
+  const latestIntervalTime = latestIntervalTimestamp(device, readings);
+  const hasCurrentIntervalData = hasRecentTimestamp(latestIntervalTime) || (hasRecentTimestamp(device.last_seen_at) && latestPoints.length > 0);
   const hasAlarmPointData = alarms.length > 0 || readings.some((reading) => String(reading.event_text || '').toUpperCase().includes('ALARM'));
 
   async function finalizeTakeover(deletePreviousData) {
@@ -1076,10 +1288,10 @@ function DevicePage({ session, data }) {
       {!hasAlarmPointData && <section className="panel setup-panel"><p className="eyebrow">Alarm setup</p><h2>Set off one test alarm from the device.</h2><p>Please set off an alarm with your desired alarm points on your physical device. Abatement Link will not know this device’s alarm points until the unit sends a <strong>HIGH ALARM</strong>, <strong>LOW ALARM</strong>, or <strong>OK ALARM</strong> event.</p><p className="muted small-note">After the alarm returns to a good value and the device sends OK ALARM, the alarm history and notifications will reflect the real alarm behavior.</p></section>}
       {!hasCurrentIntervalData && <section className="panel setup-panel"><p className="eyebrow">Live data setup</p><h2>No current interval data yet.</h2><p>To set live data, go on your device to <strong>Communications &gt; Cloud Setup &gt; Cloud Intervals</strong> and turn on/send interval data for this device.</p><p className="muted small-note">Once Abatement Link receives current INTERVAL data, this setup reminder will go away.</p></section>}
       <section className="metric-grid large">
-        {metrics.map((metric) => <div className="metric-tile" key={metric}><span>{metricIcon(metric)}</span><strong>{latest[metric]?.value ?? '—'}</strong><small>{metricLabel(metric)}</small>{latest[metric]?.timestamp && <em>{new Date(latest[metric].timestamp).toLocaleString()}</em>}</div>)}
+        {latestPoints.length ? latestPoints.map((point) => <div className="metric-tile" key={point.key}><span>{metricIcon(point.metric)}</span><strong>{point.value ?? '—'}</strong><small>{metricLabel(point.metric)} · R{point.room}S{point.sensor}</small>{point.timestamp && <em>{new Date(point.timestamp).toLocaleString()}</em>}</div>) : fallbackMetricOrder.map((metric) => <div className="metric-tile" key={metric}><span>{metricIcon(metric)}</span><strong>—</strong><small>{metricLabel(metric)}</small></div>)}
       </section>
       <section className="device-data-layout">
-        <div className="panel datalog-panel"><div className="section-head datalog-head"><div><h2>Datalog</h2><span>{groupedReadings.length} room rows · {readings.length} values</span></div><button className="secondary-button slim" type="button" onClick={() => setCsvOpen(true)}>Download CSV</button></div><div className="table-scroll datalog-scroll"><table className="datalog-room-table"><thead><tr><th>Time</th><th>Job</th><th>Room</th>{[...groupedDatalogMetrics.map((metric) => metric), ...groupedDatalogMetrics.map((metric) => `${metric}2`)].map((metricKey) => <th key={metricKey}>{metricColumnLabel(metricKey)}</th>)}<th>Event</th></tr></thead><tbody>{groupedReadings.slice(0, 100).map((row) => <tr key={row.key}><td>{new Date(row.device_ts || row.received_at).toLocaleString()}</td><td>{row.job_no || '—'}</td><td><strong>Room {row.room}</strong></td>{[...groupedDatalogMetrics.map((metric) => metric), ...groupedDatalogMetrics.map((metric) => `${metric}2`)].map((metricKey) => <td key={metricKey}>{formatReadingCell(row.values[metricKey])}</td>)}<td><span className="event-type-chip">{[...row.eventTypes].join(', ')}</span> <StatusPill status={groupAlarmStatus(row)} /><small className="event-raw muted">{row.rawEvents.slice(0, 3).join(' · ')}{row.rawEvents.length > 3 ? ' · …' : ''}</small></td></tr>)}</tbody></table></div></div>
+        <div className="panel datalog-panel"><div className="section-head datalog-head"><div><h2>Datalog</h2><span>{readings.length} values</span></div><button className="secondary-button slim" type="button" onClick={() => setCsvOpen(true)}>Download CSV</button></div><div className="table-scroll datalog-scroll"><table className="datalog-room-table"><thead><tr><th>Time</th><th>Job</th><th>Point</th><th>Metric</th><th>Value</th><th>Limits</th><th>Event</th></tr></thead><tbody>{readings.slice(0, 200).map((reading) => <tr key={reading.id}><td>{new Date(reading.device_ts || reading.received_at).toLocaleString()}</td><td>{reading.job_no || '—'}</td><td><strong>R{reading.room_no || 1}S{reading.sensor_no || 1}</strong></td><td>{metricLabel(reading.metric)}</td><td>{reading.value ?? '—'}</td><td>{reading.lower_limit ?? '—'} / {reading.upper_limit ?? '—'}</td><td><span className="event-type-chip">{eventTypeFromText(reading.event_text)}</span> <StatusPill status={readingAlarmStatus(reading)} /><small className="event-raw muted">{reading.event_text || ''}</small></td></tr>)}</tbody></table></div></div>
         <div className="panel"><div className="section-head"><h2>Alarm history</h2><span>{alarms.length}</span></div><div className="alarm-list">{alarms.length ? alarms.map((a) => <div className="alarm-item" key={a.id}><StatusPill status={a.alarm_state} /><strong>{metricLabel(a.metric)} {a.value}</strong><small>{new Date(a.started_at).toLocaleString()} {a.resolved_at ? `→ resolved ${new Date(a.resolved_at).toLocaleString()}` : 'active'}</small></div>) : <p className="muted">No alarms yet.</p>}</div></div>
       </section>
       <section className="panel danger-panel soft"><h2>Delete device</h2><p>Deleting removes device registration, datalog, alarm history, notification settings, and company links.</p><button className="danger-button" onClick={deleteDevice}>Delete device and data</button></section>
@@ -1606,6 +1818,448 @@ function ProjectPage({ session, data }) {
   );
 }
 
+
+
+function MapDashboardPage({ session, data }) {
+  const scopeOptions = useMemo(() => deviceScopeOptions(data), [data.devices, data.companies, data.companyDevices, data.projects, data.projectAssets, data.areas, data.areaDevices]);
+  const [scopeKey, setScopeKey] = useState('all:all');
+  const [selectedPlanId, setSelectedPlanId] = useState('');
+  const [planForm, setPlanForm] = useState({ name: 'Main live map', file: null });
+  const [areaForm, setAreaForm] = useState({ name: '', notes: '' });
+  const [areaDeviceForm, setAreaDeviceForm] = useState({ areaId: '', deviceId: '' });
+  const [placingDeviceId, setPlacingDeviceId] = useState('');
+  const [manualAsset, setManualAsset] = useState({ label: '', asset_type: 'scrubber', hepa_life_percent: 100, runtime_hours: '', installed_at: '', notes: '' });
+  const [message, setMessage] = useState('');
+  const [drawMode, setDrawMode] = useState(false);
+  const [drawTool, setDrawTool] = useState('wall');
+  const [drawLabel, setDrawLabel] = useState('');
+  const [drawStart, setDrawStart] = useState(null);
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [draggingAssetId, setDraggingAssetId] = useState(null);
+  const [draftPositions, setDraftPositions] = useState({});
+  const mapSurfaceRef = useRef(null);
+
+  useEffect(() => {
+    if (!scopeOptions.some((option) => `${option.type}:${option.id}` === scopeKey)) setScopeKey('all:all');
+  }, [scopeOptions, scopeKey]);
+
+  const visibleDevices = useMemo(() => devicesForScope(data, scopeKey), [data, scopeKey]);
+  const visibleDeviceIds = useMemo(() => new Set(visibleDevices.map((device) => device.id)), [visibleDevices]);
+  const plans = useMemo(() => floorplansForScope(data, scopeKey), [data.floorplans, scopeKey]);
+  const currentPlan = plans.find((plan) => plan.id === selectedPlanId) || plans[0] || null;
+  const selectedArea = scopeKey.startsWith('area:') ? data.areas?.find((area) => area.id === scopeKey.split(':')[1]) : null;
+
+  useEffect(() => {
+    if (!currentPlan) setSelectedPlanId('');
+    else if (selectedPlanId !== currentPlan.id) setSelectedPlanId(currentPlan.id);
+  }, [currentPlan?.id]);
+
+  const planAssets = useMemo(() => {
+    if (!currentPlan) return [];
+    return (data.floorplanAssets || []).filter((asset) => asset.floorplan_id === currentPlan.id);
+  }, [data.floorplanAssets, currentPlan?.id]);
+
+  const placedDeviceIds = new Set(planAssets.filter((asset) => asset.device_id).map((asset) => asset.device_id));
+  const unplacedDevices = visibleDevices.filter((device) => !placedDeviceIds.has(device.id));
+  const activeAlarms = (data.alarms || []).filter((alarm) => visibleDeviceIds.has(alarm.device_id) && !alarm.resolved_at);
+  const recentAlarms = (data.alarms || []).filter((alarm) => visibleDeviceIds.has(alarm.device_id)).slice(0, 30);
+  const connectedDevices = visibleDevices.filter((device) => connectionStatus(device) === 'connected');
+  const offlineDevices = visibleDevices.filter((device) => connectionStatus(device) === 'disconnected');
+  const attentionDevices = visibleDevices.filter((device) => ['high', 'low', 'offline'].includes(mapDeviceStatus(device, data)));
+  const selectedScope = scopeOptions.find((option) => `${option.type}:${option.id}` === scopeKey);
+  const layout = currentPlan?.layout_json || {};
+  const layoutWalls = Array.isArray(layout.walls) ? layout.walls : [];
+  const layoutZones = Array.isArray(layout.zones) ? layout.zones : [];
+  const layoutLabels = Array.isArray(layout.labels) ? layout.labels : [];
+  const layoutArrows = Array.isArray(layout.arrows) ? layout.arrows : [];
+
+  function getMapPoint(event) {
+    const rect = mapSurfaceRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 50, y: 50 };
+    const x = Math.max(0, Math.min(100, ((event.clientX - rect.left) / rect.width) * 100));
+    const y = Math.max(0, Math.min(100, ((event.clientY - rect.top) / rect.height) * 100));
+    return { x, y };
+  }
+
+  async function createArea(e) {
+    e.preventDefault();
+    const name = areaForm.name.trim();
+    if (!name) return setMessage('Name the area first.');
+    const payload = selectedScopePayload(scopeKey);
+    const { error } = await supabase.from('areas').insert({
+      name,
+      notes: areaForm.notes.trim() || null,
+      company_id: payload.company_id,
+      project_id: payload.project_id,
+      created_by: session.user.id,
+    });
+    setMessage(error ? error.message : `Area created: ${name}`);
+    if (!error) setAreaForm({ name: '', notes: '' });
+    data.refresh();
+  }
+
+  async function addDeviceToArea() {
+    if (!areaDeviceForm.areaId || !areaDeviceForm.deviceId) return setMessage('Choose an area and a device first.');
+    const { error } = await supabase.from('area_devices').insert({
+      area_id: areaDeviceForm.areaId,
+      device_id: areaDeviceForm.deviceId,
+      added_by: session.user.id,
+    });
+    setMessage(error ? error.message : 'Device added to area view.');
+    if (!error) setAreaDeviceForm({ areaId: areaDeviceForm.areaId, deviceId: '' });
+    data.refresh();
+  }
+
+  async function createFloorplan(e) {
+    e.preventDefault();
+    setMessage('');
+    try {
+      let imageDataUrl = null;
+      if (planForm.file) imageDataUrl = await readFileAsDataUrl(planForm.file);
+      const { company_id, project_id, area_id } = selectedScopePayload(scopeKey);
+      const area = area_id ? data.areas?.find((item) => item.id === area_id) : null;
+      const { data: created, error } = await supabase.from('floorplans').insert({
+        name: planForm.name.trim() || 'Live map',
+        company_id: area?.company_id || company_id,
+        project_id: area?.project_id || project_id,
+        area_id,
+        image_data_url: imageDataUrl,
+        layout_json: { walls: [], zones: [], labels: [], arrows: [] },
+        created_by: session.user.id,
+      }).select().single();
+      if (error) throw error;
+      setPlanForm({ name: 'Main live map', file: null });
+      setSelectedPlanId(created.id);
+      setMessage('Map created. Add devices, equipment, zones, labels, and arrows next.');
+      data.refresh();
+    } catch (err) {
+      setMessage(err.message || 'Could not create map.');
+    }
+  }
+
+  async function placeDevice() {
+    if (!currentPlan || !placingDeviceId) return setMessage('Choose a map and device first.');
+    const device = visibleDevices.find((item) => item.id === placingDeviceId) || data.devices.find((item) => item.id === placingDeviceId);
+    const { error } = await supabase.from('floorplan_assets').insert({
+      floorplan_id: currentPlan.id,
+      device_id: placingDeviceId,
+      asset_type: 'monitor',
+      label: device?.nickname || device?.serial_number || 'Monitor',
+      x: 50,
+      y: 50,
+      metadata: { display_metric: 'primary' },
+    });
+    setMessage(error ? error.message : 'Device placed on map. Drag it where it belongs.');
+    setPlacingDeviceId('');
+    data.refresh();
+  }
+
+  async function addManualAsset() {
+    if (!currentPlan) return setMessage('Create or choose a map first.');
+    const label = manualAsset.label.trim();
+    if (!label) return setMessage('Name the asset first.');
+    const metadata = manualAsset.asset_type === 'scrubber'
+      ? {
+        hepa_status: 'manual',
+        hepa_life_percent: metadataNumber(manualAsset.hepa_life_percent, 100),
+        runtime_hours: metadataNumber(manualAsset.runtime_hours, null),
+        installed_at: manualAsset.installed_at || null,
+        notes: manualAsset.notes || '',
+      }
+      : { notes: manualAsset.notes || '' };
+    const { error } = await supabase.from('floorplan_assets').insert({
+      floorplan_id: currentPlan.id,
+      device_id: null,
+      asset_type: manualAsset.asset_type,
+      label,
+      x: 55,
+      y: 55,
+      metadata,
+    });
+    setMessage(error ? error.message : 'Manual equipment added. Scrubber/HEPA status will display on the map.');
+    setManualAsset({ label: '', asset_type: 'scrubber', hepa_life_percent: 100, runtime_hours: '', installed_at: '', notes: '' });
+    data.refresh();
+  }
+
+  async function removeMapAsset(asset) {
+    if (!window.confirm('Remove this item from the map? This does not delete the device.')) return;
+    const { error } = await supabase.from('floorplan_assets').delete().eq('id', asset.id);
+    setMessage(error ? error.message : 'Removed from map.');
+    data.refresh();
+  }
+
+  function beginDrag(event, asset) {
+    event.preventDefault();
+    event.stopPropagation();
+    setDraggingAssetId(asset.id);
+    setDraftPositions((positions) => ({ ...positions, [asset.id]: { x: Number(asset.x ?? 50), y: Number(asset.y ?? 50) } }));
+  }
+
+  function moveDrag(event) {
+    if (!draggingAssetId) return;
+    event.preventDefault();
+    const point = getMapPoint(event);
+    setDraftPositions((positions) => ({ ...positions, [draggingAssetId]: point }));
+  }
+
+  async function endDrag(event) {
+    if (!draggingAssetId) return;
+    const point = getMapPoint(event);
+    const assetId = draggingAssetId;
+    setDraggingAssetId(null);
+    setDraftPositions((positions) => ({ ...positions, [assetId]: point }));
+    await supabase.from('floorplan_assets').update({ x: point.x, y: point.y, updated_at: new Date().toISOString() }).eq('id', assetId);
+    data.refresh();
+  }
+
+  async function saveLayout(nextLayout, successMessage) {
+    if (!currentPlan) return;
+    const { error } = await supabase.from('floorplans').update({ layout_json: nextLayout, updated_at: new Date().toISOString() }).eq('id', currentPlan.id);
+    setMessage(error ? error.message : successMessage);
+    data.refresh();
+  }
+
+  async function handleMapClick(event) {
+    if (!drawMode || !currentPlan || draggingAssetId) return;
+    const point = getMapPoint(event);
+    const baseLayout = currentPlan.layout_json || {};
+    const walls = Array.isArray(baseLayout.walls) ? baseLayout.walls : [];
+    const zones = Array.isArray(baseLayout.zones) ? baseLayout.zones : [];
+    const labels = Array.isArray(baseLayout.labels) ? baseLayout.labels : [];
+    const arrows = Array.isArray(baseLayout.arrows) ? baseLayout.arrows : [];
+
+    if (drawTool === 'label') {
+      const label = drawLabel.trim() || 'Label';
+      await saveLayout({ ...baseLayout, walls, zones, labels: [...labels, { x: point.x, y: point.y, text: label }], arrows }, `Label added: ${label}`);
+      return;
+    }
+
+    if (!drawStart) {
+      setDrawStart(point);
+      return;
+    }
+
+    if (drawTool === 'zone') {
+      const x = Math.min(drawStart.x, point.x);
+      const y = Math.min(drawStart.y, point.y);
+      const width = Math.abs(drawStart.x - point.x);
+      const height = Math.abs(drawStart.y - point.y);
+      const label = drawLabel.trim() || `Zone ${zones.length + 1}`;
+      await saveLayout({ ...baseLayout, walls, zones: [...zones, { x, y, width, height, label }], labels, arrows }, 'Zone saved.');
+    } else if (drawTool === 'arrow') {
+      const label = drawLabel.trim() || '';
+      await saveLayout({ ...baseLayout, walls, zones, labels, arrows: [...arrows, { x1: drawStart.x, y1: drawStart.y, x2: point.x, y2: point.y, label }] }, 'Pressure arrow saved.');
+    } else {
+      await saveLayout({ ...baseLayout, walls: [...walls, { x1: drawStart.x, y1: drawStart.y, x2: point.x, y2: point.y }], zones, labels, arrows }, 'Wall saved. Click two more points to keep drawing.');
+    }
+    setDrawStart(null);
+  }
+
+  async function clearDrawing() {
+    if (!currentPlan || !window.confirm('Clear walls, zones, labels, and arrows on this map?')) return;
+    const baseLayout = currentPlan.layout_json || {};
+    await saveLayout({ ...baseLayout, walls: [], zones: [], labels: [], arrows: [] }, 'Drawing layer cleared.');
+    setDrawStart(null);
+  }
+
+  return (
+    <AppShell session={session} title="Live Map" data={data}>
+      <section className="hero-card map-hero">
+        <div>
+          <p className="eyebrow">Command center</p>
+          <h1>Live map dashboard for companies, projects, areas, and equipment.</h1>
+          <p className="muted">Leave this screen open to watch live pressure readings, alarms, offline devices, scrubber/HEPA status, and floorplan visuals by company, project, or area.</p>
+          {selectedScope && <span className="scope-pill">Viewing: {selectedScope.label}</span>}
+        </div>
+        <div className="map-health-stack">
+          <div><span>Devices</span><strong>{visibleDevices.length}</strong></div>
+          <div><span>Connected</span><strong>{connectedDevices.length}</strong></div>
+          <div><span>Active alarms</span><strong>{activeAlarms.length}</strong></div>
+          <div><span>Offline</span><strong>{offlineDevices.length}</strong></div>
+        </div>
+      </section>
+
+      {data.errors?.length > 0 && <div className="alert danger">Database query issue: {data.errors.map((e) => e.message).join(' | ')}</div>}
+      {message && <div className={message.toLowerCase().includes('error') || message.toLowerCase().includes('permission') ? 'alert danger' : 'alert info'}>{message}</div>}
+
+      <section className="map-layout-grid">
+        <aside className="panel map-control-panel">
+          <h2>View</h2>
+          <label>Company / project / area
+            <select value={scopeKey} onChange={(e) => { setScopeKey(e.target.value); setSelectedPlanId(''); }}>
+              {scopeOptions.map((option) => <option key={`${option.type}:${option.id}`} value={`${option.type}:${option.id}`}>{option.label} — {option.hint}</option>)}
+            </select>
+          </label>
+          {selectedArea && <div className="area-context"><strong>{selectedArea.name}</strong><small>{selectedArea.notes || areaParentLabel(selectedArea, data)}</small></div>}
+          <label>Map / floorplan
+            <select value={currentPlan?.id || ''} onChange={(e) => setSelectedPlanId(e.target.value)}>
+              {plans.length ? plans.map((plan) => <option key={plan.id} value={plan.id}>{plan.name}</option>) : <option value="">No maps yet</option>}
+            </select>
+          </label>
+
+          <form className="form-stack compact-form" onSubmit={createArea}>
+            <h3>Create area / sub-view</h3>
+            <label>Area name<input value={areaForm.name} onChange={(e) => setAreaForm({ ...areaForm, name: e.target.value })} placeholder="Left hospital wing" /></label>
+            <label>Notes<input value={areaForm.notes} onChange={(e) => setAreaForm({ ...areaForm, notes: e.target.value })} placeholder="Floor, department, containment zone…" /></label>
+            <button className="secondary-button">Create area</button>
+          </form>
+
+          <div className="form-stack compact-form">
+            <h3>Add device to area</h3>
+            <label>Area<select value={areaDeviceForm.areaId} onChange={(e) => setAreaDeviceForm({ ...areaDeviceForm, areaId: e.target.value })}>
+              <option value="">Choose area</option>
+              {(data.areas || []).map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}
+            </select></label>
+            <label>Device<select value={areaDeviceForm.deviceId} onChange={(e) => setAreaDeviceForm({ ...areaDeviceForm, deviceId: e.target.value })}>
+              <option value="">Choose device</option>
+              {(data.devices || []).map((device) => <option key={device.id} value={device.id}>{device.nickname || device.serial_number}</option>)}
+            </select></label>
+            <button className="secondary-button" type="button" onClick={addDeviceToArea}>Add to area</button>
+          </div>
+
+          <form className="form-stack compact-form" onSubmit={createFloorplan}>
+            <h3>Create map</h3>
+            <label>Name<input value={planForm.name} onChange={(e) => setPlanForm({ ...planForm, name: e.target.value })} /></label>
+            <label>Upload floorplan image<input type="file" accept="image/*" onChange={(e) => setPlanForm({ ...planForm, file: e.target.files?.[0] || null })} /></label>
+            <button className="primary-button">Create map</button>
+          </form>
+
+          <div className="map-tools-row">
+            <button className="secondary-button slim" type="button" onClick={() => setZoom((value) => Math.min(3.5, Number((value + 0.15).toFixed(2))))}>＋</button>
+            <button className="secondary-button slim" type="button" onClick={() => setZoom((value) => Math.max(0.35, Number((value - 0.15).toFixed(2))))}>－</button>
+            <button className="secondary-button slim" type="button" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}>Reset</button>
+          </div>
+          <div className="map-pan-grid">
+            <button type="button" onClick={() => setPan((value) => ({ ...value, y: value.y + 40 }))}>↑</button>
+            <button type="button" onClick={() => setPan((value) => ({ ...value, x: value.x + 40 }))}>←</button>
+            <button type="button" onClick={() => setPan((value) => ({ ...value, x: value.x - 40 }))}>→</button>
+            <button type="button" onClick={() => setPan((value) => ({ ...value, y: value.y - 40 }))}>↓</button>
+          </div>
+          <div className="drawing-toolbox">
+            <button className={drawMode ? 'primary-button' : 'secondary-button'} type="button" onClick={() => { setDrawMode((value) => !value); setDrawStart(null); }}>{drawMode ? 'Drawing on…' : 'Draw on map'}</button>
+            <label>Tool<select value={drawTool} onChange={(e) => { setDrawTool(e.target.value); setDrawStart(null); }}><option value="wall">Wall line</option><option value="zone">Zone box</option><option value="label">Label</option><option value="arrow">Pressure arrow</option></select></label>
+            <label>Label text<input value={drawLabel} onChange={(e) => setDrawLabel(e.target.value)} placeholder="Room 204 / Negative pressure" /></label>
+            <button className="ghost-button" type="button" onClick={clearDrawing}>Clear drawing layer</button>
+          </div>
+        </aside>
+
+        <section className="map-main-panel">
+          <div className="map-toolbar panel">
+            <div>
+              <h2>{currentPlan?.name || 'No map selected'}</h2>
+              <p className="muted">{drawMode ? (drawTool === 'label' ? 'Click the map to place a label.' : drawStart ? 'Click the second point.' : `Click the first point for ${drawTool}.`) : 'Drag markers to place devices. Use zoom/pan controls for a map-style view.'}</p>
+            </div>
+            <div className="inline-actions map-place-actions">
+              <select value={placingDeviceId} onChange={(e) => setPlacingDeviceId(e.target.value)} disabled={!currentPlan || !unplacedDevices.length}>
+                <option value="">{unplacedDevices.length ? 'Choose device to place' : 'All devices placed'}</option>
+                {unplacedDevices.map((device) => <option key={device.id} value={device.id}>{device.nickname || device.serial_number}</option>)}
+              </select>
+              <button className="primary-button slim" type="button" onClick={placeDevice} disabled={!placingDeviceId}>Place</button>
+            </div>
+          </div>
+
+          <div className="map-viewport panel" onPointerMove={moveDrag} onPointerUp={endDrag} onPointerLeave={endDrag}>
+            {currentPlan ? (
+              <div
+                ref={mapSurfaceRef}
+                className={currentPlan.image_data_url ? 'floorplan-surface has-image' : 'floorplan-surface'}
+                style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, backgroundImage: currentPlan.image_data_url ? `url(${currentPlan.image_data_url})` : undefined }}
+                onClick={handleMapClick}
+              >
+                <svg className="floorplan-walls" viewBox="0 0 100 100" preserveAspectRatio="none">
+                  <defs><marker id="arrowhead" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><polygon points="0 0, 5 2.5, 0 5" /></marker></defs>
+                  {layoutZones.map((zone, index) => <g key={`zone-${index}`} className="map-zone"><rect x={zone.x} y={zone.y} width={zone.width} height={zone.height} /><text x={Number(zone.x) + 1} y={Number(zone.y) + 4}>{zone.label}</text></g>)}
+                  {layoutWalls.map((wall, index) => <line key={`wall-${index}`} className="map-wall" x1={wall.x1} y1={wall.y1} x2={wall.x2} y2={wall.y2} />)}
+                  {layoutArrows.map((arrow, index) => <g key={`arrow-${index}`} className="map-arrow"><line x1={arrow.x1} y1={arrow.y1} x2={arrow.x2} y2={arrow.y2} markerEnd="url(#arrowhead)" />{arrow.label && <text x={(Number(arrow.x1) + Number(arrow.x2)) / 2} y={(Number(arrow.y1) + Number(arrow.y2)) / 2}>{arrow.label}</text>}</g>)}
+                  {layoutLabels.map((label, index) => <text key={`label-${index}`} className="map-label" x={label.x} y={label.y}>{label.text}</text>)}
+                  {drawStart && <circle className="draw-start-dot" cx={drawStart.x} cy={drawStart.y} r="1.4" />}
+                </svg>
+                {planAssets.map((asset) => {
+                  const device = data.devices.find((item) => item.id === asset.device_id);
+                  const point = device ? primaryMapPoint(device, data) : null;
+                  const status = assetMapStatus(asset, device, data);
+                  const pos = draftPositions[asset.id] || { x: Number(asset.x ?? 50), y: Number(asset.y ?? 50) };
+                  return (
+                    <button
+                      type="button"
+                      key={asset.id}
+                      className={`map-marker ${status}`}
+                      style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
+                      onPointerDown={(event) => beginDrag(event, asset)}
+                      title="Drag to move"
+                    >
+                      <span className="marker-dot" />
+                      <strong>{asset.label || device?.nickname || device?.serial_number || 'Asset'}</strong>
+                      <small>{device ? formatMetricPoint(point) : assetStatusText(asset, device, data)}</small>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="empty-state map-empty"><h3>Create a map to begin</h3><p>Upload a floorplan image or create a blank layout, then drag connected devices and equipment onto it.</p></div>
+            )}
+          </div>
+        </section>
+
+        <aside className="panel map-side-panel">
+          <h2>Live status</h2>
+          <div className="map-status-list">
+            {visibleDevices.length ? visibleDevices.map((device) => {
+              const point = primaryMapPoint(device, data);
+              const status = mapDeviceStatus(device, data);
+              return (
+                <NavLink className={`map-status-row ${status}`} to={`/devices/${device.id}`} key={device.id}>
+                  <StatusPill status={status} />
+                  <div><strong>{device.nickname || device.serial_number}</strong><small>{formatMetricPoint(point)} · {mapDeviceStatusLabel(device, data)}</small></div>
+                </NavLink>
+              );
+            }) : <p className="muted">No devices in this view.</p>}
+          </div>
+
+          <h2>Add equipment</h2>
+          <div className="form-stack compact-form">
+            <label>Type<select value={manualAsset.asset_type} onChange={(e) => setManualAsset({ ...manualAsset, asset_type: e.target.value })}><option value="scrubber">Scrubber / HEPA</option><option value="equipment">Other equipment</option></select></label>
+            <label>Name<input value={manualAsset.label} onChange={(e) => setManualAsset({ ...manualAsset, label: e.target.value })} placeholder="HEPA scrubber 1" /></label>
+            {manualAsset.asset_type === 'scrubber' && <>
+              <label>HEPA life %<input type="number" min="0" max="100" value={manualAsset.hepa_life_percent} onChange={(e) => setManualAsset({ ...manualAsset, hepa_life_percent: e.target.value })} /></label>
+              <label>Runtime hours<input type="number" min="0" value={manualAsset.runtime_hours} onChange={(e) => setManualAsset({ ...manualAsset, runtime_hours: e.target.value })} /></label>
+              <label>HEPA installed<input type="date" value={manualAsset.installed_at} onChange={(e) => setManualAsset({ ...manualAsset, installed_at: e.target.value })} /></label>
+            </>}
+            <label>Notes<input value={manualAsset.notes} onChange={(e) => setManualAsset({ ...manualAsset, notes: e.target.value })} placeholder="Service note" /></label>
+            <button className="secondary-button" type="button" onClick={addManualAsset}>Add placeholder</button>
+          </div>
+
+          <h2>Map items</h2>
+          <div className="map-asset-list">
+            {planAssets.length ? planAssets.map((asset) => {
+              const device = data.devices.find((item) => item.id === asset.device_id);
+              return <div className={`asset-row ${assetMapStatus(asset, device, data)}`} key={asset.id}><span>{asset.asset_type}</span><strong>{asset.label || 'Asset'}</strong><small>{assetStatusText(asset, device, data)}</small><button type="button" onClick={() => removeMapAsset(asset)}>Remove</button></div>;
+            }) : <p className="muted">Nothing placed yet.</p>}
+          </div>
+        </aside>
+      </section>
+
+      <section className="map-bottom-grid">
+        <div className="panel">
+          <div className="section-head"><h2>Needs attention</h2><span>{attentionDevices.length}</span></div>
+          <div className="map-status-list compact">
+            {attentionDevices.length ? attentionDevices.map((device) => <NavLink className={`map-status-row ${mapDeviceStatus(device, data)}`} to={`/devices/${device.id}`} key={device.id}><StatusPill status={mapDeviceStatus(device, data)} /><div><strong>{device.nickname || device.serial_number}</strong><small>{mapDeviceStatusLabel(device, data)}</small></div></NavLink>) : <p className="muted">No active alarms or offline devices in this view.</p>}
+          </div>
+        </div>
+        <div className="panel">
+          <div className="section-head"><h2>Alarm history</h2><span>{recentAlarms.length}</span></div>
+          <div className="alarm-list sidebar-history">
+            {recentAlarms.length ? recentAlarms.map((alarm) => {
+              const device = data.devices.find((item) => item.id === alarm.device_id);
+              return <div className="alarm-item" key={alarm.id}><StatusPill status={alarm.alarm_state} /><strong>{device?.nickname || device?.serial_number || 'Device'} · {metricLabel(alarm.metric)} {alarm.value}</strong><small>{displayDateTime(alarm.started_at)} {alarm.resolved_at ? `→ resolved ${displayDateTime(alarm.resolved_at)}` : 'active'}</small></div>;
+            }) : <p className="muted">No alarm history in this view yet.</p>}
+          </div>
+        </div>
+      </section>
+    </AppShell>
+  );
+}
 
 function CompaniesPage({ session, data }) {
   const [companyName, setCompanyName] = useState('');
@@ -2231,5 +2885,5 @@ export default function App() {
   if (!isSupabaseConfigured) return <ConfigMissing />;
   if (loading) return <main className="login-screen"><section className="login-card"><BrandWordmark className="login-logo" variant="tagline" /><h1>Loading…</h1></section></main>;
 
-  return <Routes><Route path="/login" element={<AuthPage session={session} />} /><Route path="/" element={<Protected session={session}><DashboardPage session={session} data={data} /></Protected>} /><Route path="/devices" element={<Protected session={session}><DevicesPage session={session} data={data} /></Protected>} /><Route path="/devices/:deviceId" element={<Protected session={session}><DevicePage session={session} data={data} /></Protected>} /><Route path="/devices/:deviceId/notifications" element={<Protected session={session}><NotificationsPage session={session} data={data} /></Protected>} /><Route path="/projects" element={<Protected session={session}><ProjectsPage session={session} data={data} /></Protected>} /><Route path="/projects/:projectId" element={<Protected session={session}><ProjectPage session={session} data={data} /></Protected>} /><Route path="/companies" element={<Protected session={session}><CompaniesPage session={session} data={data} /></Protected>} /><Route path="/ingest" element={<Protected session={session}><IngestPage session={session} data={data} /></Protected>} /><Route path="/settings" element={<Protected session={session}><SettingsPage session={session} data={data} themeMode={themeMode} setThemeMode={setThemeMode} resolvedTheme={resolvedTheme} /></Protected>} /><Route path="*" element={<Navigate to="/" replace />} /></Routes>;
+  return <Routes><Route path="/login" element={<AuthPage session={session} />} /><Route path="/" element={<Protected session={session}><DashboardPage session={session} data={data} /></Protected>} /><Route path="/devices" element={<Protected session={session}><DevicesPage session={session} data={data} /></Protected>} /><Route path="/devices/:deviceId" element={<Protected session={session}><DevicePage session={session} data={data} /></Protected>} /><Route path="/devices/:deviceId/notifications" element={<Protected session={session}><NotificationsPage session={session} data={data} /></Protected>} /><Route path="/map" element={<Protected session={session}><MapDashboardPage session={session} data={data} /></Protected>} /><Route path="/projects" element={<Protected session={session}><ProjectsPage session={session} data={data} /></Protected>} /><Route path="/projects/:projectId" element={<Protected session={session}><ProjectPage session={session} data={data} /></Protected>} /><Route path="/companies" element={<Protected session={session}><CompaniesPage session={session} data={data} /></Protected>} /><Route path="/ingest" element={<Protected session={session}><IngestPage session={session} data={data} /></Protected>} /><Route path="/settings" element={<Protected session={session}><SettingsPage session={session} data={data} themeMode={themeMode} setThemeMode={setThemeMode} resolvedTheme={resolvedTheme} /></Protected>} /><Route path="*" element={<Navigate to="/" replace />} /></Routes>;
 }

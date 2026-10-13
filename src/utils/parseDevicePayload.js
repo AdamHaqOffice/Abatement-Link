@@ -11,10 +11,10 @@ const metricAliases = [
   ['AIRFLOW', 'velocity'],
 ];
 
-function clampRoomSensor(value) {
-  const number = Number(value || 1);
-  if (!Number.isFinite(number)) return 1;
-  return Math.min(2, Math.max(1, number));
+function positiveInteger(value, fallback = 1) {
+  const number = Number(value || fallback);
+  if (!Number.isFinite(number) || number < 1) return fallback;
+  return Math.floor(number);
 }
 
 export function parseDeviceTimestamp(ts) {
@@ -53,30 +53,21 @@ function getRoomSensor(eventText, fallbackRoom) {
   const upper = String(eventText || '').toUpperCase();
   const match = upper.match(/R\s*(\d+)\s*S\s*(\d+)/);
   return {
-    room: clampRoomSensor(match ? match[1] : fallbackRoom),
-    sensor: clampRoomSensor(match ? match[2] : 1),
+    // Firmware examples can include R10S10. Do not clamp to two points.
+    room: positiveInteger(match ? match[1] : fallbackRoom, 1),
+    sensor: positiveInteger(match ? match[2] : 1, 1),
   };
 }
 
 function alarmState(value, upLimit, lowLimit, eventText) {
   const upper = String(eventText || '').toUpperCase();
 
-  // Real device alarm strings. These should override any numeric guesswork.
+  // Real device rule: an ALARM keyword means alarm flow; INTERVAL is live data only.
   if (upper.includes('OK ALARM') || upper.includes('RETURN TO OK')) return 'ok';
   if (upper.includes('HIGH ALARM')) return 'high';
   if (upper.includes('LOW ALARM')) return 'low';
-
-  if (upper.includes('INTERVAL')) {
-    if (value !== null && upLimit !== null && value > upLimit) return 'high';
-    if (value !== null && lowLimit !== null && value < lowLimit) return 'low';
-    return 'ok';
-  }
-
-  if (upper.includes('HIGH')) return 'high';
-  if (upper.includes('LOW')) return 'low';
-  if (upper.includes('OK') || upper.includes('NORMAL')) return 'ok';
-  if (value !== null && upLimit !== null && value > upLimit) return 'high';
-  if (value !== null && lowLimit !== null && value < lowLimit) return 'low';
+  if (upper.includes('ALARM')) return 'alarm';
+  if (upper.includes('INTERVAL')) return 'ok';
   return 'ok';
 }
 
