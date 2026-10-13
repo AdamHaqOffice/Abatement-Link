@@ -329,3 +329,21 @@ database/abatement-link-v2-25-drawing-tools-patch.sql
 ```
 
 For an upgraded database, run the patches in order from v2.21 through v2.25. For a fresh database, run the base schema, then all patches in order.
+
+
+## v2.26 map-first command center cleanup
+
+This build simplifies the Map section so the map/floorplan is the main focus.
+
+- Removed area/sub-view setup from the Map UI.
+- Added a compact top toolbar with view selector, map loader, new-map button, autosave indicator, and zoom controls.
+- Keeps map creation simple: click +, name the map, upload an optional floorplan image, create it.
+- Adds Auto-place so devices can be dropped onto the map immediately and dragged into position.
+- Keeps alarm history and live device status on the right rail.
+- Adds a Supabase RLS repair patch for floorplan creation/asset placement.
+
+Run:
+
+```txt
+database/abatement-link-v2-26-map-first-rls-fix.sql
+```

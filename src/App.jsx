@@ -1821,12 +1821,11 @@ function ProjectPage({ session, data }) {
 
 
 function MapDashboardPage({ session, data }) {
-  const scopeOptions = useMemo(() => deviceScopeOptions(data), [data.devices, data.companies, data.companyDevices, data.projects, data.projectAssets, data.areas, data.areaDevices]);
+  const scopeOptions = useMemo(() => deviceScopeOptions(data).filter((option) => option.type !== 'area'), [data.devices, data.companies, data.companyDevices, data.projects, data.projectAssets]);
   const [scopeKey, setScopeKey] = useState('all:all');
   const [selectedPlanId, setSelectedPlanId] = useState('');
-  const [planForm, setPlanForm] = useState({ name: 'Main live map', file: null });
-  const [areaForm, setAreaForm] = useState({ name: '', notes: '' });
-  const [areaDeviceForm, setAreaDeviceForm] = useState({ areaId: '', deviceId: '' });
+  const [planForm, setPlanForm] = useState({ name: 'Main map', file: null });
+  const [createOpen, setCreateOpen] = useState(false);
   const [placingDeviceId, setPlacingDeviceId] = useState('');
   const [manualAsset, setManualAsset] = useState({ label: '', asset_type: 'scrubber', hepa_life_percent: 100, runtime_hours: '', installed_at: '', notes: '' });
   const [message, setMessage] = useState('');
@@ -1848,7 +1847,6 @@ function MapDashboardPage({ session, data }) {
   const visibleDeviceIds = useMemo(() => new Set(visibleDevices.map((device) => device.id)), [visibleDevices]);
   const plans = useMemo(() => floorplansForScope(data, scopeKey), [data.floorplans, scopeKey]);
   const currentPlan = plans.find((plan) => plan.id === selectedPlanId) || plans[0] || null;
-  const selectedArea = scopeKey.startsWith('area:') ? data.areas?.find((area) => area.id === scopeKey.split(':')[1]) : null;
 
   useEffect(() => {
     if (!currentPlan) setSelectedPlanId('');
@@ -1882,83 +1880,71 @@ function MapDashboardPage({ session, data }) {
     return { x, y };
   }
 
-  async function createArea(e) {
-    e.preventDefault();
-    const name = areaForm.name.trim();
-    if (!name) return setMessage('Name the area first.');
-    const payload = selectedScopePayload(scopeKey);
-    const { error } = await supabase.from('areas').insert({
-      name,
-      notes: areaForm.notes.trim() || null,
-      company_id: payload.company_id,
-      project_id: payload.project_id,
-      created_by: session.user.id,
-    });
-    setMessage(error ? error.message : `Area created: ${name}`);
-    if (!error) setAreaForm({ name: '', notes: '' });
-    data.refresh();
-  }
-
-  async function addDeviceToArea() {
-    if (!areaDeviceForm.areaId || !areaDeviceForm.deviceId) return setMessage('Choose an area and a device first.');
-    const { error } = await supabase.from('area_devices').insert({
-      area_id: areaDeviceForm.areaId,
-      device_id: areaDeviceForm.deviceId,
-      added_by: session.user.id,
-    });
-    setMessage(error ? error.message : 'Device added to area view.');
-    if (!error) setAreaDeviceForm({ areaId: areaDeviceForm.areaId, deviceId: '' });
-    data.refresh();
-  }
-
   async function createFloorplan(e) {
     e.preventDefault();
     setMessage('');
     try {
       let imageDataUrl = null;
       if (planForm.file) imageDataUrl = await readFileAsDataUrl(planForm.file);
-      const { company_id, project_id, area_id } = selectedScopePayload(scopeKey);
-      const area = area_id ? data.areas?.find((item) => item.id === area_id) : null;
+      const { company_id, project_id } = selectedScopePayload(scopeKey);
       const { data: created, error } = await supabase.from('floorplans').insert({
         name: planForm.name.trim() || 'Live map',
-        company_id: area?.company_id || company_id,
-        project_id: area?.project_id || project_id,
-        area_id,
+        company_id,
+        project_id,
         image_data_url: imageDataUrl,
         layout_json: { walls: [], zones: [], labels: [], arrows: [] },
         created_by: session.user.id,
       }).select().single();
       if (error) throw error;
-      setPlanForm({ name: 'Main live map', file: null });
+      setPlanForm({ name: 'Main map', file: null });
       setSelectedPlanId(created.id);
-      setMessage('Map created. Add devices, equipment, zones, labels, and arrows next.');
+      setCreateOpen(false);
+      setMessage('Map created. Autosave is on. Place devices or draw the layout.');
       data.refresh();
     } catch (err) {
       setMessage(err.message || 'Could not create map.');
     }
   }
 
-  async function placeDevice() {
-    if (!currentPlan || !placingDeviceId) return setMessage('Choose a map and device first.');
-    const device = visibleDevices.find((item) => item.id === placingDeviceId) || data.devices.find((item) => item.id === placingDeviceId);
+  async function placeDevice(x = 50, y = 50, deviceId = placingDeviceId) {
+    if (!currentPlan || !deviceId) return setMessage('Choose a map and device first.');
+    const device = visibleDevices.find((item) => item.id === deviceId) || data.devices.find((item) => item.id === deviceId);
     const { error } = await supabase.from('floorplan_assets').insert({
       floorplan_id: currentPlan.id,
-      device_id: placingDeviceId,
+      device_id: deviceId,
       asset_type: 'monitor',
       label: device?.nickname || device?.serial_number || 'Monitor',
-      x: 50,
-      y: 50,
+      x,
+      y,
       metadata: { display_metric: 'primary' },
     });
-    setMessage(error ? error.message : 'Device placed on map. Drag it where it belongs.');
+    setMessage(error ? error.message : 'Device placed. Drag it anywhere on the map.');
     setPlacingDeviceId('');
+    data.refresh();
+  }
+
+  async function autoPlaceDevices() {
+    if (!currentPlan) return setMessage('Create or load a map first.');
+    const devices = unplacedDevices.slice(0, 100);
+    if (!devices.length) return setMessage('All visible devices are already on this map.');
+    const rows = devices.map((device, index) => ({
+      floorplan_id: currentPlan.id,
+      device_id: device.id,
+      asset_type: 'monitor',
+      label: device.nickname || device.serial_number || 'Monitor',
+      x: 12 + ((index % 5) * 18),
+      y: 18 + (Math.floor(index / 5) * 13),
+      metadata: { display_metric: 'primary' },
+    }));
+    const { error } = await supabase.from('floorplan_assets').insert(rows);
+    setMessage(error ? error.message : `Placed ${devices.length} devices. Drag them into position.`);
     data.refresh();
   }
 
   async function addManualAsset() {
     if (!currentPlan) return setMessage('Create or choose a map first.');
     const label = manualAsset.label.trim();
-    if (!label) return setMessage('Name the asset first.');
+    if (!label) return setMessage('Name the equipment first.');
     const metadata = manualAsset.asset_type === 'scrubber'
       ? {
         hepa_status: 'manual',
@@ -1977,7 +1963,7 @@ function MapDashboardPage({ session, data }) {
       y: 55,
       metadata,
     });
-    setMessage(error ? error.message : 'Manual equipment added. Scrubber/HEPA status will display on the map.');
+    setMessage(error ? error.message : 'Equipment added. Drag it into position.');
     setManualAsset({ label: '', asset_type: 'scrubber', hepa_life_percent: 100, runtime_hours: '', installed_at: '', notes: '' });
     data.refresh();
   }
@@ -2020,242 +2006,200 @@ function MapDashboardPage({ session, data }) {
     data.refresh();
   }
 
-  async function handleMapClick(event) {
+  function handleMapClick(event) {
     if (!drawMode || !currentPlan || draggingAssetId) return;
+    if (event.target.closest?.('.map-marker')) return;
     const point = getMapPoint(event);
-    const baseLayout = currentPlan.layout_json || {};
-    const walls = Array.isArray(baseLayout.walls) ? baseLayout.walls : [];
-    const zones = Array.isArray(baseLayout.zones) ? baseLayout.zones : [];
-    const labels = Array.isArray(baseLayout.labels) ? baseLayout.labels : [];
-    const arrows = Array.isArray(baseLayout.arrows) ? baseLayout.arrows : [];
-
+    const labelText = drawLabel.trim();
+    const baseLayout = { walls: layoutWalls, zones: layoutZones, labels: layoutLabels, arrows: layoutArrows };
     if (drawTool === 'label') {
-      const label = drawLabel.trim() || 'Label';
-      await saveLayout({ ...baseLayout, walls, zones, labels: [...labels, { x: point.x, y: point.y, text: label }], arrows }, `Label added: ${label}`);
+      saveLayout({ ...baseLayout, labels: [...layoutLabels, { x: point.x, y: point.y, text: labelText || 'Label' }] }, 'Label saved.');
       return;
     }
-
     if (!drawStart) {
       setDrawStart(point);
       return;
     }
-
-    if (drawTool === 'zone') {
-      const x = Math.min(drawStart.x, point.x);
-      const y = Math.min(drawStart.y, point.y);
-      const width = Math.abs(drawStart.x - point.x);
-      const height = Math.abs(drawStart.y - point.y);
-      const label = drawLabel.trim() || `Zone ${zones.length + 1}`;
-      await saveLayout({ ...baseLayout, walls, zones: [...zones, { x, y, width, height, label }], labels, arrows }, 'Zone saved.');
+    if (drawTool === 'wall') {
+      saveLayout({ ...baseLayout, walls: [...layoutWalls, { x1: drawStart.x, y1: drawStart.y, x2: point.x, y2: point.y }] }, 'Wall saved.');
+    } else if (drawTool === 'zone') {
+      saveLayout({ ...baseLayout, zones: [...layoutZones, { x: Math.min(drawStart.x, point.x), y: Math.min(drawStart.y, point.y), width: Math.abs(point.x - drawStart.x), height: Math.abs(point.y - drawStart.y), label: labelText || 'Zone' }] }, 'Zone saved.');
     } else if (drawTool === 'arrow') {
-      const label = drawLabel.trim() || '';
-      await saveLayout({ ...baseLayout, walls, zones, labels, arrows: [...arrows, { x1: drawStart.x, y1: drawStart.y, x2: point.x, y2: point.y, label }] }, 'Pressure arrow saved.');
-    } else {
-      await saveLayout({ ...baseLayout, walls: [...walls, { x1: drawStart.x, y1: drawStart.y, x2: point.x, y2: point.y }], zones, labels, arrows }, 'Wall saved. Click two more points to keep drawing.');
+      saveLayout({ ...baseLayout, arrows: [...layoutArrows, { x1: drawStart.x, y1: drawStart.y, x2: point.x, y2: point.y, label: labelText || 'Pressure' }] }, 'Arrow saved.');
     }
     setDrawStart(null);
   }
 
-  async function clearDrawing() {
-    if (!currentPlan || !window.confirm('Clear walls, zones, labels, and arrows on this map?')) return;
-    const baseLayout = currentPlan.layout_json || {};
-    await saveLayout({ ...baseLayout, walls: [], zones: [], labels: [], arrows: [] }, 'Drawing layer cleared.');
-    setDrawStart(null);
+  function clearDrawing() {
+    if (!currentPlan || !window.confirm('Clear walls, zones, labels, and arrows from this map?')) return;
+    saveLayout({ walls: [], zones: [], labels: [], arrows: [] }, 'Drawing layer cleared.');
+  }
+
+  function refreshMap() {
+    setMessage('Autosave is on. Latest map data loaded.');
+    data.refresh();
   }
 
   return (
-    <AppShell session={session} title="Live Map" data={data}>
-      <section className="hero-card map-hero">
-        <div>
-          <p className="eyebrow">Command center</p>
-          <h1>Live map dashboard for companies, projects, areas, and equipment.</h1>
-          <p className="muted">Leave this screen open to watch live pressure readings, alarms, offline devices, scrubber/HEPA status, and floorplan visuals by company, project, or area.</p>
-          {selectedScope && <span className="scope-pill">Viewing: {selectedScope.label}</span>}
-        </div>
-        <div className="map-health-stack">
-          <div><span>Devices</span><strong>{visibleDevices.length}</strong></div>
-          <div><span>Connected</span><strong>{connectedDevices.length}</strong></div>
-          <div><span>Active alarms</span><strong>{activeAlarms.length}</strong></div>
-          <div><span>Offline</span><strong>{offlineDevices.length}</strong></div>
-        </div>
-      </section>
-
-      {data.errors?.length > 0 && <div className="alert danger">Database query issue: {data.errors.map((e) => e.message).join(' | ')}</div>}
-      {message && <div className={message.toLowerCase().includes('error') || message.toLowerCase().includes('permission') ? 'alert danger' : 'alert info'}>{message}</div>}
-
-      <section className="map-layout-grid">
-        <aside className="panel map-control-panel">
-          <h2>View</h2>
-          <label>Company / project / area
-            <select value={scopeKey} onChange={(e) => { setScopeKey(e.target.value); setSelectedPlanId(''); }}>
-              {scopeOptions.map((option) => <option key={`${option.type}:${option.id}`} value={`${option.type}:${option.id}`}>{option.label} — {option.hint}</option>)}
-            </select>
-          </label>
-          {selectedArea && <div className="area-context"><strong>{selectedArea.name}</strong><small>{selectedArea.notes || areaParentLabel(selectedArea, data)}</small></div>}
-          <label>Map / floorplan
-            <select value={currentPlan?.id || ''} onChange={(e) => setSelectedPlanId(e.target.value)}>
-              {plans.length ? plans.map((plan) => <option key={plan.id} value={plan.id}>{plan.name}</option>) : <option value="">No maps yet</option>}
-            </select>
-          </label>
-
-          <form className="form-stack compact-form" onSubmit={createArea}>
-            <h3>Create area / sub-view</h3>
-            <label>Area name<input value={areaForm.name} onChange={(e) => setAreaForm({ ...areaForm, name: e.target.value })} placeholder="Left hospital wing" /></label>
-            <label>Notes<input value={areaForm.notes} onChange={(e) => setAreaForm({ ...areaForm, notes: e.target.value })} placeholder="Floor, department, containment zone…" /></label>
-            <button className="secondary-button">Create area</button>
-          </form>
-
-          <div className="form-stack compact-form">
-            <h3>Add device to area</h3>
-            <label>Area<select value={areaDeviceForm.areaId} onChange={(e) => setAreaDeviceForm({ ...areaDeviceForm, areaId: e.target.value })}>
-              <option value="">Choose area</option>
-              {(data.areas || []).map((area) => <option key={area.id} value={area.id}>{area.name}</option>)}
-            </select></label>
-            <label>Device<select value={areaDeviceForm.deviceId} onChange={(e) => setAreaDeviceForm({ ...areaDeviceForm, deviceId: e.target.value })}>
-              <option value="">Choose device</option>
-              {(data.devices || []).map((device) => <option key={device.id} value={device.id}>{device.nickname || device.serial_number}</option>)}
-            </select></label>
-            <button className="secondary-button" type="button" onClick={addDeviceToArea}>Add to area</button>
-          </div>
-
-          <form className="form-stack compact-form" onSubmit={createFloorplan}>
-            <h3>Create map</h3>
-            <label>Name<input value={planForm.name} onChange={(e) => setPlanForm({ ...planForm, name: e.target.value })} /></label>
-            <label>Upload floorplan image<input type="file" accept="image/*" onChange={(e) => setPlanForm({ ...planForm, file: e.target.files?.[0] || null })} /></label>
-            <button className="primary-button">Create map</button>
-          </form>
-
-          <div className="map-tools-row">
-            <button className="secondary-button slim" type="button" onClick={() => setZoom((value) => Math.min(3.5, Number((value + 0.15).toFixed(2))))}>＋</button>
-            <button className="secondary-button slim" type="button" onClick={() => setZoom((value) => Math.max(0.35, Number((value - 0.15).toFixed(2))))}>－</button>
-            <button className="secondary-button slim" type="button" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}>Reset</button>
-          </div>
-          <div className="map-pan-grid">
-            <button type="button" onClick={() => setPan((value) => ({ ...value, y: value.y + 40 }))}>↑</button>
-            <button type="button" onClick={() => setPan((value) => ({ ...value, x: value.x + 40 }))}>←</button>
-            <button type="button" onClick={() => setPan((value) => ({ ...value, x: value.x - 40 }))}>→</button>
-            <button type="button" onClick={() => setPan((value) => ({ ...value, y: value.y - 40 }))}>↓</button>
-          </div>
-          <div className="drawing-toolbox">
-            <button className={drawMode ? 'primary-button' : 'secondary-button'} type="button" onClick={() => { setDrawMode((value) => !value); setDrawStart(null); }}>{drawMode ? 'Drawing on…' : 'Draw on map'}</button>
-            <label>Tool<select value={drawTool} onChange={(e) => { setDrawTool(e.target.value); setDrawStart(null); }}><option value="wall">Wall line</option><option value="zone">Zone box</option><option value="label">Label</option><option value="arrow">Pressure arrow</option></select></label>
-            <label>Label text<input value={drawLabel} onChange={(e) => setDrawLabel(e.target.value)} placeholder="Room 204 / Negative pressure" /></label>
-            <button className="ghost-button" type="button" onClick={clearDrawing}>Clear drawing layer</button>
-          </div>
-        </aside>
-
-        <section className="map-main-panel">
-          <div className="map-toolbar panel">
-            <div>
-              <h2>{currentPlan?.name || 'No map selected'}</h2>
-              <p className="muted">{drawMode ? (drawTool === 'label' ? 'Click the map to place a label.' : drawStart ? 'Click the second point.' : `Click the first point for ${drawTool}.`) : 'Drag markers to place devices. Use zoom/pan controls for a map-style view.'}</p>
-            </div>
-            <div className="inline-actions map-place-actions">
-              <select value={placingDeviceId} onChange={(e) => setPlacingDeviceId(e.target.value)} disabled={!currentPlan || !unplacedDevices.length}>
-                <option value="">{unplacedDevices.length ? 'Choose device to place' : 'All devices placed'}</option>
-                {unplacedDevices.map((device) => <option key={device.id} value={device.id}>{device.nickname || device.serial_number}</option>)}
+    <AppShell session={session} title="Map" data={data}>
+      <section className="map-command-shell">
+        <div className="map-command-top panel">
+          <div className="map-scope-strip">
+            <label>
+              <span>View</span>
+              <select value={scopeKey} onChange={(e) => { setScopeKey(e.target.value); setSelectedPlanId(''); }}>
+                {scopeOptions.map((option) => <option key={`${option.type}:${option.id}`} value={`${option.type}:${option.id}`}>{option.label}</option>)}
               </select>
-              <button className="primary-button slim" type="button" onClick={placeDevice} disabled={!placingDeviceId}>Place</button>
-            </div>
+            </label>
+            <label>
+              <span>Map</span>
+              <select value={currentPlan?.id || ''} onChange={(e) => setSelectedPlanId(e.target.value)}>
+                {plans.length ? plans.map((plan) => <option key={plan.id} value={plan.id}>{plan.name}</option>) : <option value="">No maps yet</option>}
+              </select>
+            </label>
           </div>
+          <div className="map-icon-actions" aria-label="Map actions">
+            <button type="button" title="New map" onClick={() => setCreateOpen((value) => !value)}>＋</button>
+            <button type="button" title="Autosave status" onClick={refreshMap}>💾</button>
+            <button type="button" title="Load maps" onClick={() => { data.refresh(); setMessage('Maps reloaded.'); }}>📂</button>
+            <button type="button" title="Zoom in" onClick={() => setZoom((value) => Math.min(3.5, Number((value + 0.15).toFixed(2))))}>＋</button>
+            <button type="button" title="Zoom out" onClick={() => setZoom((value) => Math.max(0.35, Number((value - 0.15).toFixed(2))))}>－</button>
+            <button type="button" title="Reset view" onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}>Reset</button>
+          </div>
+        </div>
 
-          <div className="map-viewport panel" onPointerMove={moveDrag} onPointerUp={endDrag} onPointerLeave={endDrag}>
-            {currentPlan ? (
-              <div
-                ref={mapSurfaceRef}
-                className={currentPlan.image_data_url ? 'floorplan-surface has-image' : 'floorplan-surface'}
-                style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, backgroundImage: currentPlan.image_data_url ? `url(${currentPlan.image_data_url})` : undefined }}
-                onClick={handleMapClick}
-              >
-                <svg className="floorplan-walls" viewBox="0 0 100 100" preserveAspectRatio="none">
-                  <defs><marker id="arrowhead" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><polygon points="0 0, 5 2.5, 0 5" /></marker></defs>
-                  {layoutZones.map((zone, index) => <g key={`zone-${index}`} className="map-zone"><rect x={zone.x} y={zone.y} width={zone.width} height={zone.height} /><text x={Number(zone.x) + 1} y={Number(zone.y) + 4}>{zone.label}</text></g>)}
-                  {layoutWalls.map((wall, index) => <line key={`wall-${index}`} className="map-wall" x1={wall.x1} y1={wall.y1} x2={wall.x2} y2={wall.y2} />)}
-                  {layoutArrows.map((arrow, index) => <g key={`arrow-${index}`} className="map-arrow"><line x1={arrow.x1} y1={arrow.y1} x2={arrow.x2} y2={arrow.y2} markerEnd="url(#arrowhead)" />{arrow.label && <text x={(Number(arrow.x1) + Number(arrow.x2)) / 2} y={(Number(arrow.y1) + Number(arrow.y2)) / 2}>{arrow.label}</text>}</g>)}
-                  {layoutLabels.map((label, index) => <text key={`label-${index}`} className="map-label" x={label.x} y={label.y}>{label.text}</text>)}
-                  {drawStart && <circle className="draw-start-dot" cx={drawStart.x} cy={drawStart.y} r="1.4" />}
-                </svg>
-                {planAssets.map((asset) => {
-                  const device = data.devices.find((item) => item.id === asset.device_id);
-                  const point = device ? primaryMapPoint(device, data) : null;
-                  const status = assetMapStatus(asset, device, data);
-                  const pos = draftPositions[asset.id] || { x: Number(asset.x ?? 50), y: Number(asset.y ?? 50) };
-                  return (
-                    <button
-                      type="button"
-                      key={asset.id}
-                      className={`map-marker ${status}`}
-                      style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
-                      onPointerDown={(event) => beginDrag(event, asset)}
-                      title="Drag to move"
-                    >
-                      <span className="marker-dot" />
-                      <strong>{asset.label || device?.nickname || device?.serial_number || 'Asset'}</strong>
-                      <small>{device ? formatMetricPoint(point) : assetStatusText(asset, device, data)}</small>
-                    </button>
-                  );
-                })}
+        {message && <div className="alert info map-message">{message}</div>}
+
+        {createOpen && (
+          <form className="panel map-create-bar" onSubmit={createFloorplan}>
+            <label>Map name<input value={planForm.name} onChange={(e) => setPlanForm({ ...planForm, name: e.target.value })} /></label>
+            <label>Floorplan image<input type="file" accept="image/*" onChange={(e) => setPlanForm({ ...planForm, file: e.target.files?.[0] || null })} /></label>
+            <button className="primary-button">Create map</button>
+            <button className="ghost-button" type="button" onClick={() => setCreateOpen(false)}>Cancel</button>
+          </form>
+        )}
+
+        <section className="map-command-grid">
+          <main className="map-stage panel">
+            <div className="map-stage-minihead">
+              <div>
+                <strong>{currentPlan?.name || 'No map loaded'}</strong>
+                <small>{selectedScope?.label || 'All my devices'} · {visibleDevices.length} devices · {activeAlarms.length} active alarms · {offlineDevices.length} offline</small>
               </div>
-            ) : (
-              <div className="empty-state map-empty"><h3>Create a map to begin</h3><p>Upload a floorplan image or create a blank layout, then drag connected devices and equipment onto it.</p></div>
-            )}
-          </div>
+              <div className="inline-actions map-place-actions">
+                <select value={placingDeviceId} onChange={(e) => setPlacingDeviceId(e.target.value)} disabled={!currentPlan || !unplacedDevices.length}>
+                  <option value="">{unplacedDevices.length ? 'Choose device' : 'All devices placed'}</option>
+                  {unplacedDevices.map((device) => <option key={device.id} value={device.id}>{device.nickname || device.serial_number}</option>)}
+                </select>
+                <button className="secondary-button slim" type="button" onClick={() => placeDevice()} disabled={!placingDeviceId}>Place</button>
+                <button className="secondary-button slim" type="button" onClick={autoPlaceDevices} disabled={!currentPlan || !unplacedDevices.length}>Auto-place</button>
+              </div>
+            </div>
+
+            <div className="map-viewport map-viewport-focus" onPointerMove={moveDrag} onPointerUp={endDrag} onPointerLeave={endDrag}>
+              {currentPlan ? (
+                <div
+                  ref={mapSurfaceRef}
+                  className={currentPlan.image_data_url ? 'floorplan-surface has-image' : 'floorplan-surface'}
+                  style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`, backgroundImage: currentPlan.image_data_url ? `url(${currentPlan.image_data_url})` : undefined }}
+                  onClick={handleMapClick}
+                >
+                  <svg className="floorplan-walls" viewBox="0 0 100 100" preserveAspectRatio="none">
+                    <defs><marker id="arrowhead" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto"><polygon points="0 0, 5 2.5, 0 5" /></marker></defs>
+                    {layoutZones.map((zone, index) => <g key={`zone-${index}`} className="map-zone"><rect x={zone.x} y={zone.y} width={zone.width} height={zone.height} /><text x={Number(zone.x) + 1} y={Number(zone.y) + 4}>{zone.label}</text></g>)}
+                    {layoutWalls.map((wall, index) => <line key={`wall-${index}`} className="map-wall" x1={wall.x1} y1={wall.y1} x2={wall.x2} y2={wall.y2} />)}
+                    {layoutArrows.map((arrow, index) => <g key={`arrow-${index}`} className="map-arrow"><line x1={arrow.x1} y1={arrow.y1} x2={arrow.x2} y2={arrow.y2} markerEnd="url(#arrowhead)" />{arrow.label && <text x={(Number(arrow.x1) + Number(arrow.x2)) / 2} y={(Number(arrow.y1) + Number(arrow.y2)) / 2}>{arrow.label}</text>}</g>)}
+                    {layoutLabels.map((label, index) => <text key={`label-${index}`} className="map-label" x={label.x} y={label.y}>{label.text}</text>)}
+                    {drawStart && <circle className="draw-start-dot" cx={drawStart.x} cy={drawStart.y} r="1.4" />}
+                  </svg>
+                  {planAssets.map((asset) => {
+                    const device = data.devices.find((item) => item.id === asset.device_id);
+                    const point = device ? primaryMapPoint(device, data) : null;
+                    const status = assetMapStatus(asset, device, data);
+                    const pos = draftPositions[asset.id] || { x: Number(asset.x ?? 50), y: Number(asset.y ?? 50) };
+                    return (
+                      <button
+                        type="button"
+                        key={asset.id}
+                        className={`map-marker ${status}`}
+                        style={{ left: `${pos.x}%`, top: `${pos.y}%` }}
+                        onPointerDown={(event) => beginDrag(event, asset)}
+                        title="Drag to move"
+                      >
+                        <span className="marker-dot" />
+                        <strong>{asset.label || device?.nickname || device?.serial_number || 'Asset'}</strong>
+                        <small>{device ? formatMetricPoint(point) : assetStatusText(asset, device, data)}</small>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="empty-state map-empty clean-map-empty">
+                  <h3>No map yet</h3>
+                  <p>Hit ＋, upload a floorplan, then drag devices onto it.</p>
+                  <button className="primary-button" type="button" onClick={() => setCreateOpen(true)}>Create map</button>
+                </div>
+              )}
+            </div>
+          </main>
+
+          <aside className="map-live-rail panel">
+            <div className="rail-section">
+              <div className="rail-title"><strong>Alarms</strong><span>{activeAlarms.length}</span></div>
+              <div className="alarm-list sidebar-history compact-history">
+                {recentAlarms.length ? recentAlarms.map((alarm) => {
+                  const device = data.devices.find((item) => item.id === alarm.device_id);
+                  return <div className="alarm-item" key={alarm.id}><StatusPill status={alarm.alarm_state} /><strong>{device?.nickname || device?.serial_number || 'Device'} · {metricLabel(alarm.metric)} {alarm.value}</strong><small>{displayDateTime(alarm.started_at)} {alarm.resolved_at ? `→ resolved ${displayDateTime(alarm.resolved_at)}` : 'active'}</small></div>;
+                }) : <p className="muted">No alarms in this view.</p>}
+              </div>
+            </div>
+
+            <div className="rail-section">
+              <div className="rail-title"><strong>Live devices</strong><span>{connectedDevices.length}/{visibleDevices.length}</span></div>
+              <div className="map-status-list compact">
+                {visibleDevices.length ? visibleDevices.map((device) => {
+                  const point = primaryMapPoint(device, data);
+                  const status = mapDeviceStatus(device, data);
+                  return (
+                    <NavLink className={`map-status-row ${status}`} to={`/devices/${device.id}`} key={device.id}>
+                      <StatusPill status={status} />
+                      <div><strong>{device.nickname || device.serial_number}</strong><small>{formatMetricPoint(point)} · {mapDeviceStatusLabel(device, data)}</small></div>
+                    </NavLink>
+                  );
+                }) : <p className="muted">No devices in this view.</p>}
+              </div>
+            </div>
+
+            <details className="rail-section rail-details">
+              <summary>Draw / equipment tools</summary>
+              <div className="drawing-toolbox clean-tools">
+                <button className={drawMode ? 'primary-button' : 'secondary-button'} type="button" onClick={() => { setDrawMode((value) => !value); setDrawStart(null); }}>{drawMode ? 'Drawing on' : 'Draw'}</button>
+                <label>Tool<select value={drawTool} onChange={(e) => { setDrawTool(e.target.value); setDrawStart(null); }}><option value="wall">Wall</option><option value="zone">Zone</option><option value="label">Label</option><option value="arrow">Pressure arrow</option></select></label>
+                <label>Text<input value={drawLabel} onChange={(e) => setDrawLabel(e.target.value)} placeholder="Room / note" /></label>
+                <button className="ghost-button" type="button" onClick={clearDrawing}>Clear drawing</button>
+              </div>
+              <div className="form-stack compact-form">
+                <label>Equipment type<select value={manualAsset.asset_type} onChange={(e) => setManualAsset({ ...manualAsset, asset_type: e.target.value })}><option value="scrubber">Scrubber / HEPA</option><option value="equipment">Other equipment</option></select></label>
+                <label>Name<input value={manualAsset.label} onChange={(e) => setManualAsset({ ...manualAsset, label: e.target.value })} placeholder="HEPA scrubber 1" /></label>
+                {manualAsset.asset_type === 'scrubber' && <>
+                  <label>HEPA life %<input type="number" min="0" max="100" value={manualAsset.hepa_life_percent} onChange={(e) => setManualAsset({ ...manualAsset, hepa_life_percent: e.target.value })} /></label>
+                  <label>Runtime hours<input type="number" min="0" value={manualAsset.runtime_hours} onChange={(e) => setManualAsset({ ...manualAsset, runtime_hours: e.target.value })} /></label>
+                </>}
+                <button className="secondary-button" type="button" onClick={addManualAsset}>Add equipment</button>
+              </div>
+            </details>
+
+            <details className="rail-section rail-details">
+              <summary>Map items</summary>
+              <div className="map-asset-list">
+                {planAssets.length ? planAssets.map((asset) => {
+                  const device = data.devices.find((item) => item.id === asset.device_id);
+                  return <div className={`asset-row ${assetMapStatus(asset, device, data)}`} key={asset.id}><span>{asset.asset_type}</span><strong>{asset.label || 'Asset'}</strong><small>{assetStatusText(asset, device, data)}</small><button type="button" onClick={() => removeMapAsset(asset)}>Remove</button></div>;
+                }) : <p className="muted">Nothing placed yet.</p>}
+              </div>
+            </details>
+          </aside>
         </section>
-
-        <aside className="panel map-side-panel">
-          <h2>Live status</h2>
-          <div className="map-status-list">
-            {visibleDevices.length ? visibleDevices.map((device) => {
-              const point = primaryMapPoint(device, data);
-              const status = mapDeviceStatus(device, data);
-              return (
-                <NavLink className={`map-status-row ${status}`} to={`/devices/${device.id}`} key={device.id}>
-                  <StatusPill status={status} />
-                  <div><strong>{device.nickname || device.serial_number}</strong><small>{formatMetricPoint(point)} · {mapDeviceStatusLabel(device, data)}</small></div>
-                </NavLink>
-              );
-            }) : <p className="muted">No devices in this view.</p>}
-          </div>
-
-          <h2>Add equipment</h2>
-          <div className="form-stack compact-form">
-            <label>Type<select value={manualAsset.asset_type} onChange={(e) => setManualAsset({ ...manualAsset, asset_type: e.target.value })}><option value="scrubber">Scrubber / HEPA</option><option value="equipment">Other equipment</option></select></label>
-            <label>Name<input value={manualAsset.label} onChange={(e) => setManualAsset({ ...manualAsset, label: e.target.value })} placeholder="HEPA scrubber 1" /></label>
-            {manualAsset.asset_type === 'scrubber' && <>
-              <label>HEPA life %<input type="number" min="0" max="100" value={manualAsset.hepa_life_percent} onChange={(e) => setManualAsset({ ...manualAsset, hepa_life_percent: e.target.value })} /></label>
-              <label>Runtime hours<input type="number" min="0" value={manualAsset.runtime_hours} onChange={(e) => setManualAsset({ ...manualAsset, runtime_hours: e.target.value })} /></label>
-              <label>HEPA installed<input type="date" value={manualAsset.installed_at} onChange={(e) => setManualAsset({ ...manualAsset, installed_at: e.target.value })} /></label>
-            </>}
-            <label>Notes<input value={manualAsset.notes} onChange={(e) => setManualAsset({ ...manualAsset, notes: e.target.value })} placeholder="Service note" /></label>
-            <button className="secondary-button" type="button" onClick={addManualAsset}>Add placeholder</button>
-          </div>
-
-          <h2>Map items</h2>
-          <div className="map-asset-list">
-            {planAssets.length ? planAssets.map((asset) => {
-              const device = data.devices.find((item) => item.id === asset.device_id);
-              return <div className={`asset-row ${assetMapStatus(asset, device, data)}`} key={asset.id}><span>{asset.asset_type}</span><strong>{asset.label || 'Asset'}</strong><small>{assetStatusText(asset, device, data)}</small><button type="button" onClick={() => removeMapAsset(asset)}>Remove</button></div>;
-            }) : <p className="muted">Nothing placed yet.</p>}
-          </div>
-        </aside>
-      </section>
-
-      <section className="map-bottom-grid">
-        <div className="panel">
-          <div className="section-head"><h2>Needs attention</h2><span>{attentionDevices.length}</span></div>
-          <div className="map-status-list compact">
-            {attentionDevices.length ? attentionDevices.map((device) => <NavLink className={`map-status-row ${mapDeviceStatus(device, data)}`} to={`/devices/${device.id}`} key={device.id}><StatusPill status={mapDeviceStatus(device, data)} /><div><strong>{device.nickname || device.serial_number}</strong><small>{mapDeviceStatusLabel(device, data)}</small></div></NavLink>) : <p className="muted">No active alarms or offline devices in this view.</p>}
-          </div>
-        </div>
-        <div className="panel">
-          <div className="section-head"><h2>Alarm history</h2><span>{recentAlarms.length}</span></div>
-          <div className="alarm-list sidebar-history">
-            {recentAlarms.length ? recentAlarms.map((alarm) => {
-              const device = data.devices.find((item) => item.id === alarm.device_id);
-              return <div className="alarm-item" key={alarm.id}><StatusPill status={alarm.alarm_state} /><strong>{device?.nickname || device?.serial_number || 'Device'} · {metricLabel(alarm.metric)} {alarm.value}</strong><small>{displayDateTime(alarm.started_at)} {alarm.resolved_at ? `→ resolved ${displayDateTime(alarm.resolved_at)}` : 'active'}</small></div>;
-            }) : <p className="muted">No alarm history in this view yet.</p>}
-          </div>
-        </div>
       </section>
     </AppShell>
   );
